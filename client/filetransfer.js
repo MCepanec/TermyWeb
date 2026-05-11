@@ -48,31 +48,16 @@ class FileTransferManager {
 
   onTransferAccepted(transferId, receiverId,
                       file, send, onProgress) {
-    // Server confirmed recipient accepted — start sending chunks
-    const existing = this.fileKeys.get(transferId);
-    if (existing?.key) {
-      this.fileKeys.set(transferId, {
-        key: existing.key,
-        file: file ?? existing.file
-      });
-    }
+    // Server confirmed recipient accepted —
+    // start sending chunks
     this._sendChunks(transferId, receiverId,
                      file, send, onProgress);
   }
 
   async _sendChunks(transferId, receiverId,
                      file, send, onProgress) {
-    const stored = this.fileKeys.get(transferId);
-    if (!stored?.key) {
-      throw new Error(
-        `Missing encryption key for transfer ${transferId}`);
-    }
-    const key = stored.key;
-    file = file ?? stored.file;
-    if (!file) {
-      throw new Error(
-        `Missing file for transfer ${transferId}`);
-      }
+    const key   = await SC.crypto.generateFileKey();
+    this.fileKeys.set(transferId, key);
 
     const totalChunks =
       Math.ceil(file.size / CHUNK_SIZE);

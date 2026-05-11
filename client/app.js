@@ -701,16 +701,6 @@ function onFileAccepted(msg) {
   const resolvedFile = pendingFiles.get(msg.transferId);
   if (!resolvedFile) return;
 
-  if (!SC.ft.fileKeys.has(msg.transferId)) {
-    for (const [k, v] of SC.ft.fileKeys.entries()) {
-      if (k.startsWith('temp_')) {
-        SC.ft.fileKeys.set(msg.transferId, v);
-        SC.ft.fileKeys.delete(k);
-        break;
-      }
-    }
-  }
-
   SC.ft.onTransferAccepted(
     msg.transferId,
     msg.receiverId,
@@ -775,7 +765,6 @@ async function sendFileToPanel(file, panel) {
 
   const tempId = 'temp_' + Date.now();
   pendingFiles.set(tempId, file);
-  SC.ft.fileKeys.set(tempId, { key, file });
 
   send({
     type:     'file_offer',
