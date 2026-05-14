@@ -64,13 +64,160 @@ SC.ui = {
   },
 
   // ── Friends ───────────────────────────────────────────
-  renderFriends(friends, myId, onChat) {
+  // ── Friend request badge ────────────────────────────
+  setFriendRequestBadge(count) {
+    const btn = $('friend-requests-btn');
+    if (!btn) return;
+    let badge = btn.querySelector('.fr-badge');
+    if (count > 0) {
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'fr-badge';
+        btn.style.position = 'relative';
+        btn.appendChild(badge);
+      }
+      badge.textContent = count > 9 ? '9+' : count;
+    } else if (badge) {
+      badge.remove();
+    }
+  },
+
+  // ── Friend context menu ─────────────────────────────
+  showFriendCtx(e, friend, onChat, onRemove) {
+    // Remove existing
+    const old = document.getElementById('friend-ctx');
+    if (old) old.remove();
+
+    const menu = document.createElement('div');
+    menu.id        = 'friend-ctx';
+    menu.className = 'ctx-menu';
+    menu.style.cssText =
+      `position:fixed;left:${e.clientX}px;` +
+      `top:${e.clientY}px;z-index:9999`;
+
+    const items = [
+      {
+        label: '💬 Open Chat',
+        action: onChat
+      },
+      { sep: true },
+      {
+        label: '✕ Remove Friend',
+        cls:   'danger',
+        action: onRemove
+      }
+    ];
+
+    items.forEach(item => {
+      if (item.sep) {
+        const s = document.createElement('div');
+        s.className = 'ctx-sep';
+        menu.appendChild(s);
+        return;
+      }
+      const btn = document.createElement('button');
+      btn.className = 'ctx-item' +
+        (item.cls ? ' ' + item.cls : '');
+      btn.textContent = item.label;
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        menu.remove();
+        item.action();
+      };
+      menu.appendChild(btn);
+    });
+
+    document.body.appendChild(menu);
+
+    // Clamp to viewport
+    requestAnimationFrame(() => {
+      const r = menu.getBoundingClientRect();
+      if (r.right > window.innerWidth)
+        menu.style.left =
+          (window.innerWidth - r.width - 4) + 'px';
+      if (r.bottom > window.innerHeight)
+        menu.style.top =
+          (window.innerHeight - r.height - 4) + 'px';
+    });
+
+    const dismiss = () => {
+      menu.remove();
+      document.removeEventListener('click', dismiss);
+    };
+    setTimeout(() =>
+      document.addEventListener('click', dismiss), 0);
+  },
+
+  // ── Friend request list modal ───────────────────────
+  showFriendRequests(requests, onAccept, onDecline) {
+    if (requests.length === 0) {
+      this.showModal('Friend Requests',
+        '<div style="color:var(--text-dim);' +
+        'text-align:center;padding:12px">' +
+        'No pending requests</div>');
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.style.cssText =
+      'display:flex;flex-direction:column;gap:6px';
+    requests.forEach(req => {
+      const row = document.createElement('div');
+      row.className = 'member-row';
+      row.style.padding = '6px 0';
+      row.innerHTML = `
+        <span style="color:var(--text-bright)">
+          ${esc(req.username)}
+        </span>
+        <div style="display:flex;gap:6px">
+          <button class="fr-accept"
+                  style="background:none;
+                         border:1px solid var(--green);
+                         color:var(--green);
+                         font-family:var(--font);
+                         font-size:11px;
+                         padding:3px 10px;
+                         cursor:pointer">
+            Accept
+          </button>
+          <button class="fr-decline"
+                  style="background:none;
+                         border:1px solid var(--red);
+                         color:var(--red);
+                         font-family:var(--font);
+                         font-size:11px;
+                         padding:3px 10px;
+                         cursor:pointer">
+            Decline
+          </button>
+        </div>
+      `;
+      row.querySelector('.fr-accept')
+         .onclick = () => {
+           row.remove();
+           onAccept(req);
+           if (!wrap.children.length)
+             this.hideModal();
+         };
+      row.querySelector('.fr-decline')
+         .onclick = () => {
+           row.remove();
+           onDecline(req);
+           if (!wrap.children.length)
+             this.hideModal();
+         };
+      wrap.appendChild(row);
+    });
+    this.showModal('Friend Requests', wrap);
+  },
+
+  renderFriends(friends, myId, onChat, onRemove) {
     const el = $('friend-list');
     el.innerHTML = '';
     if (!friends.length) {
       el.innerHTML =
-        '<div class="list-item" style="color:var(--text-dim);cursor:default">' +
-        'No friends yet</div>';
+        '<div class="list-item" ' +
+        'style="color:var(--text-dim);' +
+        'cursor:default">No friends yet</div>';
       return;
     }
     friends.forEach(f => {
@@ -78,11 +225,25 @@ SC.ui = {
       div.className = 'list-item';
       div.dataset.id = f.id;
       div.innerHTML = `
-        <div class="presence-dot ${f.online ? 'online' : ''}"></div>
-        <span class="list-item-name">${esc(f.username)}</span>
-        <span class="list-item-sub">${f.online ? 'online' : 'offline'}</span>
+        <div class="presence-dot
+          ${f.online ? 'online' : ''}"></div>
+        <span class="list-item-name">
+          ${esc(f.username)}
+        </span>
+        <span class="list-item-sub">
+          ${f.online ? 'online' : 'offline'}
+        </span>
       `;
+      // Left click → open chat
       div.onclick = () => onChat(f);
+      // Right click → context menu
+      div.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        this.showFriendCtx(e, f,
+          () => onChat(f),
+          () => onRemove(f)
+        );
+      });
       el.appendChild(div);
     });
   },

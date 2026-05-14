@@ -10,6 +10,7 @@ let myUsername = null;
 
 // State
 let friends    = [];
+let pendingFriendRequests = [];
 let groups     = [];
 let vchats     = [];
 let currentChat = null; // {type:'dm'|'group', id, data}
@@ -66,6 +67,7 @@ async function handleMessage(msg) {
         myUsername = msg.username;
         SC.ui.showApp(msg.username);
         loadFriends();
+        send({ type: 'get_friend_requests' });
         loadGroups();
         loadVChats();
       } else {
@@ -93,8 +95,19 @@ async function handleMessage(msg) {
 
     case 'friend_list_resp':
       friends = msg.friends;
-      SC.ui.renderFriends(friends, myUserId,
-        openDMChat);
+      SC.ui.renderFriends(
+        friends, myUserId,
+        openDMChat,
+        (f) => {
+          if (!confirm(
+            `Remove ${f.username} as a friend?`))
+            return;
+          send({
+            type:     'remove_friend',
+            friendId: f.id
+          });
+        }
+      );
       break;
 
     case 'add_friend_resp':
@@ -102,6 +115,50 @@ async function handleMessage(msg) {
         SC.ui.hideModal();
         loadFriends();
       }
+      break;
+
+    case 'friend_req_resp':
+      if (msg.ok) {
+        SC.ui.hideModal();
+        SC.ui.appendSystemMsg?.(`✓ ${msg.msg}`);
+      } else {
+        const errEl = document.querySelector(
+          '#modal-body .err');
+        if (errEl) errEl.textContent = msg.msg;
+      }
+      break;
+
+    case 'friend_requests_resp':
+      pendingFriendRequests = msg.requests;
+      SC.ui.setFriendRequestBadge(
+        pendingFriendRequests.length);
+      break;
+
+    case 'friend_request_received':
+      pendingFriendRequests.push({
+        id:       msg.fromId,
+        from_id:  msg.fromId,
+        username: msg.fromUser
+      });
+      SC.ui.setFriendRequestBadge(
+        pendingFriendRequests.length);
+      playNotifSound();
+      break;
+
+    case 'friend_request_accepted':
+      // Someone accepted our request —
+      // refresh friend list
+      loadFriends();
+      break;
+
+    case 'friend_req_action_resp':
+      send({ type: 'get_friend_requests' });
+      if (msg.action === 'accepted')
+        loadFriends();
+      break;
+
+    case 'remove_friend_resp':
+      if (msg.ok) loadFriends();
       break;
 
     case 'presence':
@@ -463,7 +520,7 @@ async function onDMReceived(msg) {
       msg.ephemeralPub, identity.privateKey);
   } catch { text = '[decryption failed]'; }
 
-  const key = chatKey('dm', msg.fromId);
+  const key     = chatKey('dm', msg.fromId);
   const panelId = chatToPanel.get(key);
 
   if (panelId != null) {
@@ -473,12 +530,28 @@ async function onDMReceived(msg) {
       text,
       isSelf:    false
     });
-  } else {
-    const k = `dm_${msg.fromId}`;
-    unread.set(k, (unread.get(k) ?? 0) + 1);
-    SC.ui.setBadge(msg.fromId, unread.get(k));
-    playNotifSound();
+    // Only notify if this isn't a history replay
+    if (!msg.isHistory) playNotifSound();
+  } else if (!msg.isHistory) {
+    // Auto-open chat when message arrives live
+    if (msg.autoOpen) {
+      const friend = friends.find(
+        f => f.id === msg.fromId)
+        ?? { id: msg.fromId,
+              username: msg.fromUser,
+              online: true,
+              public_key: null };
+      openDMChat(friend);
+      // Message will appear via history load
+    } else {
+      // No auto-open — badge only
+      const k = `dm_${msg.fromId}`;
+      unread.set(k, (unread.get(k) ?? 0) + 1);
+      SC.ui.setBadge(msg.fromId, unread.get(k));
+      playNotifSound();
+    }
   }
+  // If isHistory=true and panel not open: silently ignore
 }
 
 async function sendDM(text) {
@@ -568,7 +641,7 @@ async function onGroupMsgReceived(msg) {
       msg.ephemeralPub, identity.privateKey);
   } catch { text = '[decryption failed]'; }
 
-  const key = chatKey('group', msg.groupId);
+  const key     = chatKey('group', msg.groupId);
   const panelId = chatToPanel.get(key);
 
   if (panelId != null) {
@@ -578,7 +651,8 @@ async function onGroupMsgReceived(msg) {
       text,
       isSelf:    false
     });
-  } else {
+    if (!msg.isHistory) playNotifSound();
+  } else if (!msg.isHistory) {
     const k = `grp_${msg.groupId}`;
     unread.set(k, (unread.get(k) ?? 0) + 1);
     SC.ui.setGroupBadge(msg.groupId, unread.get(k));
@@ -905,16 +979,50 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Add friend
   document.getElementById('add-friend-btn')
     .onclick = () => {
-      SC.ui.showModal('Add Friend',
-        SC.ui.modalInput('Username', 'Add',
+      SC.ui.showModal('Send Friend Request',
+        SC.ui.modalInput('Username', 'Send Request',
           (val, err) => {
             if (!val) {
               err.textContent = 'Enter a username';
               return;
             }
-            send({ type: 'add_friend',
-                   username: val });
+            send({
+              type:     'send_friend_request',
+              username: val
+            });
           }));
+    };
+
+  document.getElementById('friend-requests-btn')
+    .onclick = () => {
+      send({ type: 'get_friend_requests' });
+      setTimeout(() => {
+        SC.ui.showFriendRequests(
+          pendingFriendRequests,
+          (req) => {
+            send({
+              type:  'accept_friend_request',
+              reqId: req.id
+            });
+            pendingFriendRequests =
+              pendingFriendRequests.filter(
+                r => r.id !== req.id);
+            SC.ui.setFriendRequestBadge(
+              pendingFriendRequests.length);
+          },
+          (req) => {
+            send({
+              type:  'decline_friend_request',
+              reqId: req.id
+            });
+            pendingFriendRequests =
+              pendingFriendRequests.filter(
+                r => r.id !== req.id);
+            SC.ui.setFriendRequestBadge(
+              pendingFriendRequests.length);
+          }
+        );
+      }, 300);
     };
 
   // Create group

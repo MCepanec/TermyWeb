@@ -107,6 +107,14 @@ async function handleMessage(ws, msg) {
     // Deliver offline messages
     deliverOffline(ws, user.id);
 
+    const pending = db.getFriendRequests(user.id);
+    if (pending.length > 0) {
+      send(ws, {
+        type: 'friend_requests_resp',
+        requests: pending
+      });
+    }
+
     // Broadcast online presence
     const friends = db.getFriends(user.id);
     broadcast(
@@ -127,14 +135,95 @@ async function handleMessage(ws, msg) {
     return send(ws, { type: 'friend_list_resp', friends });
   }
 
-  if (type === 'add_friend') {
+// ── Friend requests ──────────────────────────────────
+  if (type === 'send_friend_request') {
     const target = db.findUser(msg.username);
-    if (!target) return send(ws, {
-      type: 'add_friend_resp', ok: false,
-      msg: 'User not found' });
-    db.addFriend(ws.userId, target.id);
-    return send(ws, { type: 'add_friend_resp',
-                       ok: true, msg: 'Friend added' });
+    if (!target)
+      return send(ws, {
+        type: 'friend_req_resp',
+        ok: false, msg: 'User not found'
+      });
+    if (target.id === ws.userId)
+      return send(ws, {
+        type: 'friend_req_resp',
+        ok: false, msg: 'Cannot add yourself'
+      });
+    if (db.areFriends(ws.userId, target.id))
+      return send(ws, {
+        type: 'friend_req_resp',
+        ok: false, msg: 'Already friends'
+      });
+    if (db.hasPendingRequest(ws.userId, target.id))
+      return send(ws, {
+        type: 'friend_req_resp',
+        ok: false, msg: 'Request already sent'
+      });
+
+    db.sendFriendRequest(ws.userId, target.id);
+    send(ws, {
+      type: 'friend_req_resp',
+      ok: true,
+      msg: `Friend request sent to ${msg.username}`
+    });
+
+    // Notify target if online
+    const targetWs = online.get(target.id);
+    if (targetWs) {
+      send(targetWs, {
+        type: 'friend_request_received',
+        fromId:   ws.userId,
+        fromUser: ws.username
+      });
+    }
+    return;
+  }
+
+  if (type === 'get_friend_requests') {
+    const reqs = db.getFriendRequests(ws.userId);
+    return send(ws, {
+      type: 'friend_requests_resp',
+      requests: reqs
+    });
+  }
+
+  if (type === 'accept_friend_request') {
+    const req = db.acceptFriendRequest(
+      msg.reqId, ws.userId);
+    if (!req)
+      return send(ws, {
+        type: 'friend_req_action_resp',
+        ok: false
+      });
+    send(ws, {
+      type: 'friend_req_action_resp',
+      ok: true, action: 'accepted'
+    });
+    // Notify the requester if online
+    const fromWs = online.get(req.from_id);
+    if (fromWs) {
+      send(fromWs, {
+        type: 'friend_request_accepted',
+        byId:   ws.userId,
+        byUser: ws.username
+      });
+    }
+    return;
+  }
+
+  if (type === 'decline_friend_request') {
+    db.declineFriendRequest(msg.reqId, ws.userId);
+    return send(ws, {
+      type: 'friend_req_action_resp',
+      ok: true, action: 'declined'
+    });
+  }
+
+  if (type === 'remove_friend') {
+    db.removeFriend(ws.userId, msg.friendId);
+    return send(ws, {
+      type: 'remove_friend_resp',
+      ok: true, friendId: msg.friendId
+    });
   }
 
   // ── DM ────────────────────────────────────────────────
@@ -142,18 +231,17 @@ async function handleMessage(ws, msg) {
     const { toId, ciphertext, nonce,
             ephemeralPub, timestamp } = msg;
 
-    // Always store — needed for history
     db.storeMessage(ws.userId, toId,
       ciphertext, nonce, ephemeralPub, timestamp);
 
-    // Deliver immediately if online
     const targetWs = online.get(toId);
     if (targetWs) {
       send(targetWs, {
-        type: 'recv_msg',
+        type:        'recv_msg',
         fromId:      ws.userId,
         fromUser:    ws.username,
-        ciphertext, nonce, ephemeralPub, timestamp
+        ciphertext, nonce, ephemeralPub, timestamp,
+        autoOpen:    true   // ← tells client to open chat
       });
     }
     return send(ws, { type: 'msg_ack', ok: true });
@@ -557,7 +645,8 @@ function deliverOffline(ws, uid) {
       ciphertext:  m.ciphertext,
       nonce:       m.nonce,
       ephemeralPub:m.ephemeral_pub,
-      timestamp:   m.timestamp_unix
+      timestamp:   m.timestamp_unix,
+      isHistory:   true   // ← no notification
     });
   }
   if (msgs.length) db.markMessagesDelivered(uid);
@@ -572,7 +661,8 @@ function deliverOffline(ws, uid) {
       ciphertext:  m.ciphertext,
       nonce:       m.nonce,
       ephemeralPub:m.ephemeral_pub,
-      timestamp:   m.timestamp_unix
+      timestamp:   m.timestamp_unix,
+      isHistory:   true   // ← no notification
     });
   }
   if (gmsgs.length) db.markGroupMessagesDelivered(uid);
@@ -587,7 +677,8 @@ function deliverOffline(ws, uid) {
       fromUser:   o.from_username,
       filename:   o.filename,
       fileSize:   o.file_size,
-      encKey:     o.enc_key
+      encKey:     o.enc_key,
+      isHistory:  true
     });
   }
   if (offers.length) db.deleteOfflineFileOffers(uid);

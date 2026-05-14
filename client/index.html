@@ -65,8 +65,18 @@
         <div class="sidebar-section">
           <div class="section-header">
             <span>Friends</span>
-            <button class="icon-btn" id="add-friend-btn"
-                    title="Add friend">+</button>
+            <div style="display:flex;gap:4px">
+              <button class="icon-btn"
+                      id="friend-requests-btn"
+                      title="Friend requests">
+                📬
+              </button>
+              <button class="icon-btn"
+                      id="add-friend-btn"
+                      title="Send friend request">
+                +
+              </button>
+            </div>
           </div>
           <div id="friend-list" class="list"></div>
         </div>

@@ -24,6 +24,15 @@ db.exec(`
     PRIMARY KEY(user_id, friend_id)
   );
 
+  CREATE TABLE IF NOT EXISTS friend_requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id    INTEGER NOT NULL REFERENCES users(id),
+    to_id      INTEGER NOT NULL REFERENCES users(id),
+    status     TEXT NOT NULL DEFAULT 'pending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(from_id, to_id)
+  );
+
   CREATE TABLE IF NOT EXISTS messages (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     from_id       INTEGER NOT NULL REFERENCES users(id),
@@ -115,6 +124,61 @@ export const setPublicKey = (id, pub) =>
     .run(pub, id);
 
 // ── Friends ────────────────────────────────────────────
+export const sendFriendRequest = (fromId, toId) =>
+  stmt(`INSERT OR IGNORE INTO friend_requests
+        (from_id, to_id) VALUES(?,?)`)
+    .run(fromId, toId);
+
+export const getFriendRequests = (toId) =>
+  stmt(`SELECT fr.id, fr.from_id, u.username
+        FROM friend_requests fr
+        JOIN users u ON u.id = fr.from_id
+        WHERE fr.to_id = ? AND fr.status = 'pending'`)
+    .all(toId);
+
+export const acceptFriendRequest = (reqId, userId) => {
+  const req = stmt(
+    `SELECT * FROM friend_requests WHERE id=?`)
+    .get(reqId);
+  if (!req || req.to_id !== userId) return false;
+  stmt(`UPDATE friend_requests SET status='accepted'
+        WHERE id=?`).run(reqId);
+  // Add mutual friendship
+  stmt('INSERT OR IGNORE INTO friends VALUES(?,?)')
+    .run(req.from_id, req.to_id);
+  stmt('INSERT OR IGNORE INTO friends VALUES(?,?)')
+    .run(req.to_id, req.from_id);
+  return req;
+};
+
+export const declineFriendRequest = (reqId, userId) => {
+  const req = stmt(
+    `SELECT * FROM friend_requests WHERE id=?`)
+    .get(reqId);
+  if (!req || req.to_id !== userId) return false;
+  stmt(`UPDATE friend_requests SET status='declined'
+        WHERE id=?`).run(reqId);
+  return true;
+};
+
+export const removeFriend = (uid, fid) => {
+  stmt(`DELETE FROM friends
+        WHERE (user_id=? AND friend_id=?)
+           OR (user_id=? AND friend_id=?)`)
+    .run(uid, fid, fid, uid);
+};
+
+export const areFriends = (uid, fid) =>
+  !!stmt(`SELECT 1 FROM friends
+          WHERE user_id=? AND friend_id=?`)
+    .get(uid, fid);
+
+export const hasPendingRequest = (fromId, toId) =>
+  !!stmt(`SELECT 1 FROM friend_requests
+          WHERE from_id=? AND to_id=?
+          AND status='pending'`)
+    .get(fromId, toId);
+
 export const addFriend = (uid, fid) => {
   stmt('INSERT OR IGNORE INTO friends VALUES(?,?)')
     .run(uid, fid);
