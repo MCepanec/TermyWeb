@@ -82,72 +82,6 @@ SC.ui = {
     }
   },
 
-  // ── Friend context menu ─────────────────────────────
-  showFriendCtx(e, friend, onChat, onRemove) {
-    // Remove existing
-    const old = document.getElementById('friend-ctx');
-    if (old) old.remove();
-
-    const menu = document.createElement('div');
-    menu.id        = 'friend-ctx';
-    menu.className = 'ctx-menu';
-    menu.style.cssText =
-      `position:fixed;left:${e.clientX}px;` +
-      `top:${e.clientY}px;z-index:9999`;
-
-    const items = [
-      {
-        label: '💬 Open Chat',
-        action: onChat
-      },
-      { sep: true },
-      {
-        label: '✕ Remove Friend',
-        cls:   'danger',
-        action: onRemove
-      }
-    ];
-
-    items.forEach(item => {
-      if (item.sep) {
-        const s = document.createElement('div');
-        s.className = 'ctx-sep';
-        menu.appendChild(s);
-        return;
-      }
-      const btn = document.createElement('button');
-      btn.className = 'ctx-item' +
-        (item.cls ? ' ' + item.cls : '');
-      btn.textContent = item.label;
-      btn.onclick = (ev) => {
-        ev.stopPropagation();
-        menu.remove();
-        item.action();
-      };
-      menu.appendChild(btn);
-    });
-
-    document.body.appendChild(menu);
-
-    // Clamp to viewport
-    requestAnimationFrame(() => {
-      const r = menu.getBoundingClientRect();
-      if (r.right > window.innerWidth)
-        menu.style.left =
-          (window.innerWidth - r.width - 4) + 'px';
-      if (r.bottom > window.innerHeight)
-        menu.style.top =
-          (window.innerHeight - r.height - 4) + 'px';
-    });
-
-    const dismiss = () => {
-      menu.remove();
-      document.removeEventListener('click', dismiss);
-    };
-    setTimeout(() =>
-      document.addEventListener('click', dismiss), 0);
-  },
-
   // ── Friend request list modal ───────────────────────
   showFriendRequests(requests, onAccept, onDecline) {
     if (requests.length === 0) {
@@ -215,16 +149,16 @@ SC.ui = {
     el.innerHTML = '';
     if (!friends.length) {
       el.innerHTML =
-        '<div class="list-item" ' +
-        'style="color:var(--text-dim);' +
-        'cursor:default">No friends yet</div>';
+        '<div class="list-item" style="color:' +
+        'var(--text-dim);cursor:default">' +
+        'No friends yet</div>';
       return;
     }
     friends.forEach(f => {
       const div = document.createElement('div');
-      div.className = 'list-item';
+      div.className  = 'list-item';
       div.dataset.id = f.id;
-      div.innerHTML = `
+      div.innerHTML  = `
         <div class="presence-dot
           ${f.online ? 'online' : ''}"></div>
         <span class="list-item-name">
@@ -234,16 +168,33 @@ SC.ui = {
           ${f.online ? 'online' : 'offline'}
         </span>
       `;
+
       // Left click → open chat
-      div.onclick = () => onChat(f);
+      div.addEventListener('click', () =>
+        onChat(f));
+
       // Right click → context menu
-      div.addEventListener('contextmenu', (e) => {
+      div.addEventListener('contextmenu', e => {
         e.preventDefault();
-        this.showFriendCtx(e, f,
-          () => onChat(f),
-          () => onRemove(f)
-        );
+        SC.ctx.show(e.clientX, e.clientY, [
+          {
+            header: f.username
+          },
+          {
+            icon:   '💬',
+            label:  'Open Chat',
+            action: () => onChat(f)
+          },
+          { sep: true },
+          {
+            icon:   '✕',
+            label:  'Remove Friend',
+            cls:    'danger',
+            action: () => onRemove(f)
+          }
+        ]);
       });
+
       el.appendChild(div);
     });
   },
@@ -269,24 +220,75 @@ SC.ui = {
   },
 
   // ── Groups ────────────────────────────────────────────
-  renderGroups(groups, onOpen) {
+  renderGroups(groups, myUserId, onOpen,
+               onInvite, onMembers,
+               onLeave, onDelete) {
     const el = $('group-list');
     el.innerHTML = '';
     if (!groups.length) {
       el.innerHTML =
-        '<div class="list-item" style="color:var(--text-dim);cursor:default">' +
+        '<div class="list-item" style="color:' +
+        'var(--text-dim);cursor:default">' +
         'No groups yet</div>';
       return;
     }
     groups.forEach(g => {
+      const isCreator = g.creator_id === myUserId;
       const div = document.createElement('div');
-      div.className = 'list-item';
-      div.dataset.gid = g.id;
+      div.className    = 'list-item';
+      div.dataset.gid  = g.id;
       div.innerHTML = `
-        <span class="list-item-name"># ${esc(g.name)}</span>
-        <span class="list-item-sub">${g.members?.length ?? 0} members</span>
+        <span class="list-item-name">
+          # ${esc(g.name)}
+        </span>
+        <span class="list-item-sub">
+          ${g.members?.length ?? 0} members
+        </span>
       `;
-      div.onclick = () => onOpen(g);
+
+      // Left click → open chat
+      div.addEventListener('click', () =>
+        onOpen(g));
+
+      // Right click → context menu
+      div.addEventListener('contextmenu', e => {
+        e.preventDefault();
+        const items = [
+          { header: '# ' + g.name },
+          {
+            icon:   '💬',
+            label:  'Open Chat',
+            action: () => onOpen(g)
+          },
+          {
+            icon:   '👥',
+            label:  'Members',
+            action: () => onMembers(g)
+          },
+          {
+            icon:   '+',
+            label:  'Invite',
+            action: () => onInvite(g)
+          },
+          { sep: true },
+          {
+            icon:   '→',
+            label:  'Leave Group',
+            cls:    'danger',
+            action: () => onLeave(g)
+          }
+        ];
+        if (isCreator) {
+          items.push({
+            icon:   '🗑',
+            label:  'Delete Group',
+            cls:    'danger',
+            action: () => onDelete(g)
+          });
+        }
+        SC.ctx.show(e.clientX, e.clientY, items);
+      });
+
       el.appendChild(div);
     });
   },
@@ -297,40 +299,19 @@ SC.ui = {
                onAbandon, onDelete) {
     const el = $('vchat-list');
     el.innerHTML = '';
-
-    // Remove any existing context menu
-    const old = document.getElementById(
-      'vchat-ctx-menu');
-    if (old) old.remove();
-
     if (!vchats.length) {
       el.innerHTML =
-        '<div class="list-item" ' +
-        'style="color:var(--text-dim);' +
-        'cursor:default">No voice chats</div>';
+        '<div class="list-item" style="color:' +
+        'var(--text-dim);cursor:default">' +
+        'No voice chats</div>';
       return;
     }
-
-    // Build one shared context menu element
-    const menu = document.createElement('div');
-    menu.id        = 'vchat-ctx-menu';
-    menu.className = 'ctx-menu hidden';
-    document.body.appendChild(menu);
-
-    const hideMenu = () =>
-      menu.classList.add('hidden');
-
-    document.addEventListener('click', hideMenu,
-      { once: false });
-    document.addEventListener('contextmenu',
-      hideMenu, { once: false });
-
     vchats.forEach(v => {
-      const inCall   = v.id === activeVchatId;
+      const inCall    = v.id === activeVchatId;
       const isCreator = v.creator_id === myUserId;
 
       const div = document.createElement('div');
-      div.className = 'list-item';
+      div.className   = 'list-item';
       div.dataset.vid = v.id;
       div.innerHTML = `
         <span class="presence-dot
@@ -354,90 +335,60 @@ SC.ui = {
           : ''}
       `;
 
-      // Left click → join
-      div.addEventListener('click', (e) => {
+      // Left click → join (if not already in)
+      div.addEventListener('click', e => {
         e.stopPropagation();
-        hideMenu();
+        SC.ctx.hide();
         if (!inCall) onJoin(v);
       });
 
       // Right click → context menu
-      div.addEventListener('contextmenu', (e) => {
+      div.addEventListener('contextmenu', e => {
         e.preventDefault();
-        e.stopPropagation();
-
-        // Build menu items
-        const items = [];
+        const items = [
+          { header: '♪ ' + v.name }
+        ];
 
         if (!inCall) {
           items.push({
-            label: '▶ Join',
+            icon:   '▶',
+            label:  'Join',
+            cls:    'success',
             action: () => onJoin(v)
           });
         }
 
         items.push({
-          label: '+ Invite',
+          icon:   '+',
+          label:  'Invite',
           action: () => onInvite(v)
         });
 
         items.push({
-          label: '👥 Members',
+          icon:   '👥',
+          label:  'Members',
           action: () => onMembers(v)
         });
 
         items.push({ sep: true });
 
         items.push({
-          label: '✕ Abandon',
-          cls:   'danger',
+          icon:   '→',
+          label:  'Abandon',
+          cls:    'danger',
           action: () => onAbandon(v)
         });
 
         if (isCreator) {
           items.push({
-            label: '🗑 Delete',
-            cls:   'danger',
+            icon:   '🗑',
+            label:  'Delete',
+            cls:    'danger',
             action: () => onDelete(v)
           });
         }
 
-        // Populate menu
-        menu.innerHTML = '';
-        items.forEach(item => {
-          if (item.sep) {
-            const sep =
-              document.createElement('div');
-            sep.className = 'ctx-sep';
-            menu.appendChild(sep);
-            return;
-          }
-          const btn =
-            document.createElement('button');
-          btn.className =
-            'ctx-item' +
-            (item.cls ? ' ' + item.cls : '');
-          btn.textContent = item.label;
-          btn.onclick = (ev) => {
-            ev.stopPropagation();
-            hideMenu();
-            item.action();
-          };
-          menu.appendChild(btn);
-        });
-
-        // Position near cursor
-        menu.classList.remove('hidden');
-        const rect =
-          menu.getBoundingClientRect();
-        let x = e.clientX;
-        let y = e.clientY;
-        if (x + 160 > window.innerWidth)
-          x = window.innerWidth - 164;
-        if (y + rect.height > window.innerHeight)
-          y = window.innerHeight - rect.height - 4;
-        menu.style.left = x + 'px';
-        menu.style.top  = y + 'px';
+        SC.ctx.show(e.clientX, e.clientY, items);
       });
 
       el.appendChild(div);

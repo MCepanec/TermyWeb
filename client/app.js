@@ -1,7 +1,9 @@
 // Main application logic
 // Connects to WebSocket server and orchestrates all features
 
-const WS_URL = `ws://${location.host}`;
+const WS_URL = `${
+  location.protocol === 'https:' ? 'wss' : 'ws'
+}://${location.host}`;
 
 let ws         = null;
 let identity   = null; // { publicKey, privateKey, pub }
@@ -14,33 +16,89 @@ let pendingFriendRequests = [];
 let groups     = [];
 let vchats     = [];
 let currentChat = null; // {type:'dm'|'group', id, data}
-let fileAliasCounter = 1;
-const fileAliases = new Map(); // alias → transferId
-const pendingOffers = new Map(); // transferId → offer
+
+let loggingOut = false;
+let intentionalLogout = false;
 // Panel map: panelId → {type, chatId}
 const panelMap  = new Map();
 // Reverse: `${type}_${chatId}` → panelId
 const chatToPanel = new Map();
+
+//Session helpers
+const SESSION_KEY = 'securechat_session';
+
+const pubKeyCache = new Map();
+const PUB_KEY_TTL = 5 * 60 * 1000;
+
+function saveSession(token) {
+  localStorage.setItem(SESSION_KEY, token);
+}
+
+function loadSession() {
+  return localStorage.getItem(SESSION_KEY);
+}
+
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+}
 
 function chatKey(type, chatId) {
   return `${type}_${chatId}`;
 }
 let pendingMembersVchatId = null;
 
+//other helpers
+function hideLoadingScreen() {
+  const el = document.getElementById(
+    'loading-screen');
+  if (el) el.style.display = 'none';
+  // Remove the flag so auth screen can show
+  // if needed
+  delete document.documentElement
+    .dataset.hasSession;
+}
+
 // ── WebSocket ──────────────────────────────────────────
 function connect() {
   ws = new WebSocket(WS_URL);
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     SC.ui.setConnStatus('Connected', true);
+
+    // Don't try session resume after explicit logout
+    if (intentionalLogout) {
+      intentionalLogout = false;
+      hideLoadingScreen();
+      return;
+    }
+
+    const token = loadSession();
+    if (token) {
+      if (!identity)
+        identity =
+          await SC.crypto.loadOrCreateIdentity();
+      send({
+        type:      'session_resume',
+        token,
+        publicKey: identity.pub
+      });
+    } else {
+      hideLoadingScreen();
+    }
   };
 
   ws.onclose = () => {
-    SC.ui.setConnStatus('Disconnected — reconnecting...', false);
+    // Don't show "disconnected" if we just logged out
+    if (!intentionalLogout) {
+      SC.ui.setConnStatus(
+        'Disconnected — reconnecting...', false);
+    }
+    hideLoadingScreen();
     setTimeout(connect, 3000);
   };
 
   ws.onerror = () => {
+    hideLoadingScreen();
     SC.ui.setConnStatus('Connection error', false);
   };
 
@@ -57,21 +115,96 @@ function send(msg) {
     ws.send(JSON.stringify(msg));
 }
 
+// ── Key handler ────────────────────────────────────
+async function getFreshPublicKey(userId) {
+  const cached = pubKeyCache.get(userId);
+  if (cached &&
+      Date.now() - cached.fetchedAt < PUB_KEY_TTL)
+    return cached.key;
+
+  // Request fresh key from server
+  return new Promise((resolve) => {
+    const handler = (e) => {
+      const msg = e.detail;
+      if (msg.type === 'public_key_resp' &&
+          msg.userId === userId) {
+        document.removeEventListener(
+          '_ws_msg', handler);
+        const key = msg.publicKey ?? null;
+        if (key)
+          pubKeyCache.set(userId, {
+            key, fetchedAt: Date.now()
+          });
+        resolve(key);
+      }
+    };
+    document.addEventListener('_ws_msg', handler);
+    send({ type: 'get_public_key', userId });
+
+    // Timeout after 5s
+    setTimeout(() => {
+      document.removeEventListener(
+        '_ws_msg', handler);
+      // Fall back to cached friends list
+      const f = friends.find(x => x.id === userId);
+      resolve(f?.public_key ?? null);
+    }, 5000);
+  });
+}
+
 // ── Message handler ────────────────────────────────────
-async function handleMessage(msg) {
+  async function handleMessage(msg) {
+  // Internal pub/sub for promise-based handlers
+  const ev = new CustomEvent('_ws_msg',
+    { detail: msg });
+  document.dispatchEvent(ev);
+
   switch (msg.type) {
+
+    case 'session_resp':
+      hideLoadingScreen();
+      if (msg.ok) {
+        myUserId   = msg.userId;
+        myUsername = msg.username;
+        if (msg.token) saveSession(msg.token);
+        SC.ui.showApp(msg.username);
+        loadFriends();
+        loadGroups();
+        loadVChats();
+        send({ type: 'get_friend_requests' });
+      } else {
+        clearSession();
+        SC.ui.showAuth();
+        SC.ui.setConnStatus('Connected', true);
+      }
+      break;
 
     case 'login_resp':
       if (msg.ok) {
         myUserId   = msg.userId;
         myUsername = msg.username;
+        if (msg.token) saveSession(msg.token);
         SC.ui.showApp(msg.username);
         loadFriends();
-        send({ type: 'get_friend_requests' });
         loadGroups();
         loadVChats();
+        send({ type: 'get_friend_requests' });
       } else {
         SC.ui.setAuthError('login', msg.msg);
+      }
+      break;
+
+    case 'public_key_resp':
+      // Handled by getFreshPublicKey listener
+      // Also update local friends cache
+      if (msg.publicKey) {
+        const f = friends.find(
+          x => x.id === msg.userId);
+        if (f) f.public_key = msg.publicKey;
+        pubKeyCache.set(msg.userId, {
+          key:       msg.publicKey,
+          fetchedAt: Date.now()
+        });
       }
       break;
 
@@ -180,7 +313,70 @@ async function handleMessage(msg) {
 
     case 'group_list_resp':
       groups = msg.groups;
-      SC.ui.renderGroups(groups, openGroupChat);
+      SC.ui.renderGroups(
+        groups,
+        myUserId,
+        openGroupChat,
+        // onInvite
+        (g) => {
+          SC.ui.showModal('Invite to Group',
+            SC.ui.modalInput(
+              'Username', 'Invite',
+              (val, err) => {
+                if (!val) {
+                  err.textContent =
+                    'Enter a username';
+                  return;
+                }
+                send({
+                  type:    'group_invite',
+                  groupId: g.id,
+                  username: val
+                });
+              }));
+        },
+        // onMembers
+        (g) => {
+          const wrap =
+            document.createElement('div');
+          wrap.style.cssText =
+            'display:flex;flex-direction:' +
+            'column;gap:4px';
+          g.members?.forEach(m => {
+            const row =
+              document.createElement('div');
+            row.className = 'member-row';
+            row.innerHTML = `
+              <span>${SC.esc(m.username)}</span>
+              ${m.id === g.creator_id
+                ? '<span style="color:var(--yellow)">creator</span>'
+                : ''}
+            `;
+            wrap.appendChild(row);
+          });
+          SC.ui.showModal(
+            `# ${g.name} — Members`, wrap);
+        },
+        // onLeave
+        (g) => {
+          if (!confirm(
+            `Leave group "${g.name}"?`)) return;
+          send({
+            type:    'group_leave',
+            groupId: g.id
+          });
+        },
+        // onDelete
+        (g) => {
+          if (!confirm(
+            `Delete group "${g.name}"?\n` +
+            `This cannot be undone.`)) return;
+          send({
+            type:    'group_delete',
+            groupId: g.id
+          });
+        }
+      );
       break;
 
     case 'group_create_resp':
@@ -244,42 +440,8 @@ async function handleMessage(msg) {
       loadGroups();
       break;
 
-    case 'file_offer_sent':
-      // Remap temp key → real transferId
-      for (const [k, v] of pendingFiles.entries()) {
-        if (k.startsWith('temp_')) {
-          pendingFiles.set(msg.transferId, v);
-          pendingFiles.delete(k);
-          break;
-        }
-      }
-      break;
-
-    case 'file_offer':
-      onFileOfferReceived(msg);
-      break;
-
-    case 'file_accepted':
-      // Recipient accepted — start sending
-      onFileAccepted(msg);
-      break;
-
-    case 'file_chunk':
-      await onFileChunk(msg);
-      break;
-
-    case 'file_chunk_ack':
-      SC.ft.onChunkAck(msg.transferId, msg.chunkIdx);
-      break;
-
-    case 'file_complete':
-      SC.ui.updateFileProgress(
-        msg.transferId, 1, 1);
-      break;
-
-    case 'file_cancel':
-      SC.ui.appendSystemMsg(
-        `Transfer cancelled: ${msg.reason}`);
+    case 'file_shared':
+      onFileShared(msg);
       break;
 
     case 'vchat_list_resp':
@@ -439,16 +601,38 @@ async function handleMessage(msg) {
         loadVChats();
       }
       break;
+
+    case 'unread_counts':
+      if (msg.dms) {
+        msg.dms.forEach(row => {
+          const k = `dm_${row.from_id}`;
+          unread.set(k, row.count);
+          SC.ui.setBadge(row.from_id, row.count);
+        });
+      }
+      if (msg.groups) {
+        msg.groups.forEach(row => {
+          const k = `grp_${row.group_id}`;
+          unread.set(k, row.count);
+          SC.ui.setGroupBadge(
+            row.group_id, row.count);
+        });
+      }
+      break;
   }
 }
 
 // ── Auth ───────────────────────────────────────────────
 async function doLogin(username, password) {
-  if (!identity) {
-    identity = await SC.crypto.loadOrCreateIdentity();
-  }
-  send({ type: 'login', username, password,
-         publicKey: identity.pub });
+  if (!identity)
+    identity =
+      await SC.crypto.loadOrCreateIdentity();
+  send({
+    type:      'login',
+    username,
+    password,
+    publicKey: identity.pub
+  });
 }
 
 async function doRegister(username, password) {
@@ -460,12 +644,21 @@ async function doRegister(username, password) {
 }
 
 function logout() {
+  intentionalLogout = true;
+  loggingOut        = true;
+  send({ type: 'logout' });
+  clearSession();
   myUserId = myUsername = null;
   currentChat = null;
   friends = groups = vchats = [];
+  pendingFriendRequests = [];
   SC.voice.leave();
+  SC.ui.hideVoiceStatus?.();
+  SC.ui.setFriendRequestBadge(0);
+  // Show auth immediately — don't wait for server
   SC.ui.showAuth();
-  SC.ui.hideVoiceStatus();
+  SC.ui.setConnStatus('Connected', true);
+  loggingOut = false;
 }
 
 // ── Friends & data loading ─────────────────────────────
@@ -516,9 +709,14 @@ async function onDMReceived(msg) {
   let text;
   try {
     text = await SC.crypto.decrypt(
-      msg.ciphertext, msg.nonce,
-      msg.ephemeralPub, identity.privateKey);
-  } catch { text = '[decryption failed]'; }
+      msg.ciphertext,
+      msg.nonce,
+      msg.ephemeralPub,        
+      identity.privateKey);
+  } catch (e) {
+    console.warn('Live DM decrypt failed:', e);
+    text = '[decryption failed]';
+  }
 
   const key     = chatKey('dm', msg.fromId);
   const panelId = chatToPanel.get(key);
@@ -583,30 +781,58 @@ async function sendDM(text) {
 }
 
 async function renderDMHistory(msg) {
-  const key = chatKey('dm', msg.withId);
+  const key     = chatKey('dm', msg.withId);
   const panelId = chatToPanel.get(key);
   if (panelId == null) return;
-  // Clear existing messages first
-  const el = SC.tiler.root.querySelector(
-    `[data-pid="${panelId}"] .t-messages`);
-  if (el) { el.innerHTML = '';
-             delete el.dataset.lastDate; }
+
+  const el = SC.tiler._msgEl(panelId);
+  if (el) {
+    el.innerHTML = '';
+    delete el.dataset.lastDate;
+  }
+
   for (const m of msg.messages) {
+    const isSelf = m.from_id === myUserId;
+
+    // Check if it's a file share message
+    if (m.nonce === 'file') {
+      try {
+        const data = JSON.parse(m.ciphertext);
+        if (data.fileShare) {
+          SC.tiler.appendFile(panelId, {
+            fromUser:  m.from_username,
+            url:       data.url,
+            filename:  data.filename,
+            size:      data.size,
+            mimetype:  data.mimetype,
+            timestamp: m.timestamp_unix,
+            isSelf
+          });
+          continue;
+        }
+      } catch {}
+    }
+
+    // Regular encrypted message
     let text;
     try {
       text = await SC.crypto.decrypt(
-        m.ciphertext, m.nonce,
-        m.ephemeral_pub, identity.privateKey);
-    } catch { text = '[decryption failed]'; }
+        m.ciphertext,
+        m.nonce,
+        m.ephemeral_pub,
+        identity.privateKey);
+    } catch (e) {
+      console.warn('DM decrypt failed:', e);
+      text = '[decryption failed]';
+    }
     SC.tiler.appendMessage(panelId, {
       timestamp: m.timestamp_unix,
       author:    m.from_username,
       text,
-      isSelf:    m.from_id === myUserId
+      isSelf
     });
   }
 }
-
 // ── Group chat ─────────────────────────────────────────
 function openGroupChat(group) {
   const key = chatKey('group', group.id);
@@ -637,9 +863,14 @@ async function onGroupMsgReceived(msg) {
   let text;
   try {
     text = await SC.crypto.decrypt(
-      msg.ciphertext, msg.nonce,
-      msg.ephemeralPub, identity.privateKey);
-  } catch { text = '[decryption failed]'; }
+      msg.ciphertext,
+      msg.nonce,
+      msg.ephemeralPub,        
+      identity.privateKey);
+  } catch (e) {
+    console.warn('Live group decrypt failed:', e);
+    text = '[decryption failed]';
+  }
 
   const key     = chatKey('group', msg.groupId);
   const panelId = chatToPanel.get(key);
@@ -691,169 +922,89 @@ async function sendGroupMessage(text) {
 }
 
 async function renderGroupHistory(msg) {
-  const key = chatKey('group', msg.groupId);
+  const key     = chatKey('group', msg.groupId);
   const panelId = chatToPanel.get(key);
   if (panelId == null) return;
-  const el = SC.tiler.root.querySelector(
-    `[data-pid="${panelId}"] .t-messages`);
-  if (el) { el.innerHTML = '';
-             delete el.dataset.lastDate; }
+
+  const el = SC.tiler._msgEl(panelId);
+  if (el) {
+    el.innerHTML = '';
+    delete el.dataset.lastDate;
+  }
+
   for (const m of msg.messages) {
+    const isSelf = m.from_id === myUserId;
+
+    // Check if it's a file share message
+    if (m.nonce === 'file') {
+      try {
+        const data = JSON.parse(m.ciphertext);
+        if (data.fileShare) {
+          SC.tiler.appendFile(panelId, {
+            fromUser:  m.from_username,
+            url:       data.url,
+            filename:  data.filename,
+            size:      data.size,
+            mimetype:  data.mimetype,
+            timestamp: m.timestamp_unix,
+            isSelf
+          });
+          continue;
+        }
+      } catch {}
+    }
+
     let text;
     try {
       text = await SC.crypto.decrypt(
-        m.ciphertext, m.nonce,
-        m.ephemeral_pub, identity.privateKey);
-    } catch { text = '[decryption failed]'; }
+        m.ciphertext,
+        m.nonce,
+        m.ephemeral_pub,
+        identity.privateKey);
+    } catch (e) {
+      console.warn('Group decrypt failed:', e);
+      text = '[decryption failed]';
+    }
     SC.tiler.appendMessage(panelId, {
       timestamp: m.timestamp_unix,
       author:    m.from_username,
       text,
-      isSelf:    m.from_id === myUserId
+      isSelf
     });
   }
 }
 
 // ── File transfer ──────────────────────────────────────
-
-function onFileOfferReceived(offer) {
-  const alias = 'file' + (fileAliasCounter++);
-  fileAliases.set(alias, offer.transferId);
-  pendingOffers.set(offer.transferId, offer);
-
-  // Find the panel for this sender
-  const key = chatKey('dm', offer.fromId);
+function onFileShared(msg) {
+  const key = msg.groupId
+    ? chatKey('group', msg.groupId)
+    : chatKey('dm', msg.fromId);
   const panelId = chatToPanel.get(key);
 
-  const doShow = (pid) => {
-    if (pid != null) {
-      SC.tiler.showFileOffer(pid, offer,
-        async (o, row) => {
-          try {
-            await SC.ft.acceptOffer(
-              o.transferId, o.encKey,
-              o.filename, identity.privateKey);
-            send({ type: 'file_offer_resp',
-                   transferId: o.transferId,
-                   accept: true });
-          } catch (err) {
-            console.error('Accept error:', err);
-          }
-        },
-        (o) => {
-          send({ type: 'file_offer_resp',
-                 transferId: o.transferId,
-                 accept: false });
-          pendingOffers.delete(o.transferId);
-        }
-      );
-    } else {
-      // No panel open — show badge
-      SC.ui.setBadge(
-        offer.fromId,
-        (unread.get(`dm_${offer.fromId}`) ?? 0) + 1);
-      playNotifSound();
-    }
-  };
-
-  doShow(panelId);
-}
-
-function onFileAccepted(msg) {
-  // Sender side: recipient accepted, start sending
-  const file = pendingFiles.get(msg.transferId);
-  if (!file) {
-    // Try to find by temp key
-    for (const [k, v] of pendingFiles.entries()) {
-      if (k.startsWith('temp_')) {
-        pendingFiles.set(msg.transferId, v);
-        pendingFiles.delete(k);
-        break;
-      }
-    }
+  if (panelId != null) {
+    SC.tiler.appendFile(panelId, {
+      fromUser:  msg.fromUser,
+      url:       msg.url,
+      filename:  msg.filename,
+      size:      msg.size,
+      mimetype:  msg.mimetype,
+      timestamp: msg.timestamp,
+      isSelf:    msg.fromId === myUserId
+    });
+    if (!msg.isHistory) playNotifSound();
+  } else if (!msg.isHistory) {
+    // Badge
+    const k = msg.groupId
+      ? `grp_${msg.groupId}`
+      : `dm_${msg.fromId}`;
+    unread.set(k, (unread.get(k) ?? 0) + 1);
+    if (msg.groupId)
+      SC.ui.setGroupBadge(
+        msg.groupId, unread.get(k));
+    else
+      SC.ui.setBadge(msg.fromId, unread.get(k));
+    playNotifSound();
   }
-  const resolvedFile = pendingFiles.get(msg.transferId);
-  if (!resolvedFile) return;
-
-  SC.ft.onTransferAccepted(
-    msg.transferId,
-    msg.receiverId,
-    resolvedFile,
-    send,
-    (done, total) => {
-      SC.ui.updateFileProgress(
-        msg.transferId, done, total);
-    }
-  );
-}
-
-async function onFileChunk(msg) {
-  await SC.ft.onChunk(
-    msg.transferId, msg.data, msg.nonce,
-    msg.isLast, send,
-    (done) => {
-      const offer =
-        pendingOffers.get(msg.transferId);
-      SC.tiler.updateFileProgress(
-        msg.transferId, done,
-        offer?.fileSize ?? done);
-    },
-    (blob, filename) => {
-      SC.ui.showFileComplete(filename, blob);
-      pendingOffers.delete(msg.transferId);
-    }
-  );
-}
-
-// Track files pending send
-const pendingFiles = new Map();
-
-async function sendFileToPanel(file, panel) {
-  let recipients;
-  if (panel.type === 'dm') {
-    const f = friends.find(
-      x => x.id === panel.chatId);
-    if (!f?.public_key) return;
-    recipients = [f];
-  } else {
-    const g = groups.find(
-      x => x.id === panel.chatId);
-    if (!g) return;
-    recipients = g.members.filter(
-      m => m.id !== myUserId && m.public_key);
-  }
-  if (!recipients.length) return;
-
-  const key    =
-    await SC.crypto.generateFileKey();
-  const keyB64 =
-    await SC.crypto.exportFileKey(key);
-  const encKeys = await Promise.all(
-    recipients.map(async r => ({
-      userId: r.id,
-      encKey: JSON.stringify(
-        await SC.crypto.encrypt(
-          keyB64, r.public_key))
-    }))
-  );
-
-  const tempId = 'temp_' + Date.now();
-  pendingFiles.set(tempId, file);
-
-  send({
-    type:     'file_offer',
-    filename: file.name,
-    fileSize: file.size,
-    toId:     panel.type === 'dm'
-              ? panel.chatId : undefined,
-    groupId:  panel.type === 'group'
-              ? panel.chatId : undefined,
-    encKeys
-  });
-
-  SC.tiler.appendSystem(panel.id,
-    `[sending] "${file.name}" ` +
-    `(${SC.formatBytes(file.size)})`);
 }
 
 // ── Voice chat ─────────────────────────────────────────
@@ -1078,16 +1229,55 @@ document.addEventListener('DOMContentLoaded', async () => {
       document.getElementById('file-input').click();
     };
 
-  document.getElementById('file-input')
+document.getElementById('file-input')
     .onchange = async (e) => {
       const file = e.target.files[0];
-      if (file) {
-        const panel = window._pendingSendPanel;
-        if (panel)
-          await sendFileToPanel(file, panel);
-      }
       e.target.value = '';
+      if (!file || !window._pendingSendPanel) return;
+
+      const panel = window._pendingSendPanel;
       window._pendingSendPanel = null;
+
+      // Show uploading indicator
+      SC.tiler.appendSystem(panel.id,
+        `Uploading "${file.name}"...`);
+
+      try {
+        const result = await SC.ft.upload(
+          file,
+          (done, total) => {
+            // Could show progress here
+          }
+        );
+
+        // Notify recipients via WebSocket
+        send({
+          type:     'file_share',
+          toId:     panel.type === 'dm'
+                    ? panel.chatId : undefined,
+          groupId:  panel.type === 'group'
+                    ? panel.chatId : undefined,
+          url:      result.url,
+          filename: result.filename,
+          size:     result.size,
+          mimetype: result.mimetype
+        });
+
+        // Show in sender's panel immediately
+        SC.tiler.appendFile(panel.id, {
+          fromUser:  myUsername,
+          url:       result.url,
+          filename:  result.filename,
+          size:      result.size,
+          mimetype:  result.mimetype,
+          timestamp: Math.floor(Date.now() / 1000),
+          isSelf:    true
+        });
+
+      } catch (err) {
+        SC.tiler.appendSystem(panel.id,
+          `Upload failed: ${err.message}`);
+      }
     };
 
   // Group controls
@@ -1253,94 +1443,208 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     async onSendMessage(panel, text) {
       if (panel.type === 'dm') {
-        const friend = friends.find(
-          f => f.id === panel.chatId);
-        if (!friend?.public_key) return;
-        const bundle =
-          await SC.crypto.encrypt(
-            text, friend.public_key);
         const timestamp =
           Math.floor(Date.now() / 1000);
-        send({ type: 'send_msg',
-               toId: friend.id,
-               ...bundle, timestamp });
-        SC.tiler.appendMessage(panel.id, {
-          timestamp, author: myUsername,
-          text, isSelf: true
+
+        // Always get fresh key before encrypting
+        const pubKey = await getFreshPublicKey(
+          panel.chatId);
+        if (!pubKey) {
+          SC.tiler.appendSystem(panel.id,
+            '[error] Cannot encrypt: ' +
+            'recipient has no public key. ' +
+            'Ask them to log in first.');
+          return;
+        }
+
+        const forRecipient =
+          await SC.crypto.encrypt(text, pubKey);
+        const forSelf =
+          await SC.crypto.encrypt(
+            text, identity.pub);
+
+        send({
+          type:             'send_msg',
+          toId:             panel.chatId,
+          ciphertext:       forRecipient.ciphertext,
+          nonce:            forRecipient.nonce,
+          ephemeralPub:     forRecipient.ephemeralPub,
+          selfCiphertext:   forSelf.ciphertext,
+          selfNonce:        forSelf.nonce,
+          selfEphemeralPub: forSelf.ephemeralPub,
+          timestamp
         });
+
+        SC.tiler.appendMessage(panel.id, {
+          timestamp,
+          author: myUsername,
+          text,
+          isSelf: true
+        });
+
       } else if (panel.type === 'group') {
         const group = groups.find(
           g => g.id === panel.chatId);
         if (!group) return;
+
         const timestamp =
           Math.floor(Date.now() / 1000);
-        const recipients =
-          await Promise.all(
-            group.members
-              .filter(m => m.id !== myUserId
-                        && m.public_key)
-              .map(async m => ({
-                userId: m.id,
-                ...await SC.crypto.encrypt(
-                  text, m.public_key)
-              }))
-          );
-        send({ type: 'group_send_msg',
-               groupId: group.id,
-               recipients, timestamp });
+
+        // Fetch fresh keys for all members
+        const memberKeys = await Promise.all(
+          group.members.map(async m => ({
+            ...m,
+            public_key: await getFreshPublicKey(m.id)
+          }))
+        );
+
+        const allTargets = memberKeys.filter(
+          m => m.public_key);
+
+        const recipients = await Promise.all(
+          allTargets.map(async m => ({
+            userId: m.id,
+            ...await SC.crypto.encrypt(
+              text, m.public_key)
+          }))
+        );
+
+        // Always include self
+        if (!allTargets.find(
+            m => m.id === myUserId)) {
+          const forSelf =
+            await SC.crypto.encrypt(
+              text, identity.pub);
+          recipients.push({
+            userId: myUserId,
+            ...forSelf
+          });
+        }
+
+        send({
+          type:       'group_send_msg',
+          groupId:    group.id,
+          recipients,
+          timestamp
+        });
+
         SC.tiler.appendMessage(panel.id, {
-          timestamp, author: myUsername,
-          text, isSelf: true
+          timestamp,
+          author: myUsername,
+          text,
+          isSelf: true
         });
       }
     },
 
     onSendFile(panel) {
-      // Store which panel triggered the send
       window._pendingSendPanel = panel;
-      document.getElementById('file-input')
-        .click();
+      document.getElementById('file-input').click();
     },
 
     onGroupAction(panel, action) {
       const group = groups.find(
         g => g.id === panel.chatId);
       if (!group) return;
-      if (action === 'invite') {
-        SC.ui.showModal('Invite to Group',
-          SC.ui.modalInput('Username', 'Invite',
-            (val, err) => {
-              if (!val) return;
-              send({ type: 'group_invite',
-                     groupId: group.id,
-                     username: val });
-              SC.ui.hideModal();
-            }));
-      } else if (action === 'members') {
-        const wrap =
-          document.createElement('div');
-        group.members?.forEach(m => {
-          const row =
+
+      switch (action) {
+        case 'invite':
+          SC.ui.showModal('Invite to Group',
+            SC.ui.modalInput(
+              'Username', 'Invite',
+              (val, err) => {
+                if (!val) {
+                  err.textContent =
+                    'Enter a username';
+                  return;
+                }
+                send({
+                  type:    'group_invite',
+                  groupId: group.id,
+                  username: val
+                });
+              }));
+          break;
+
+        case 'members': {
+          const wrap =
             document.createElement('div');
-          row.className = 'member-row';
-          row.innerHTML = `
-            <span>${SC.esc(m.username)}</span>
-            ${m.id === group.creator_id
-              ? '<span style="color:var(--yellow)">creator</span>'
-              : ''}
-          `;
-          wrap.appendChild(row);
-        });
-        SC.ui.showModal(
-          `# ${group.name} — Members`, wrap);
-      } else if (action === 'leave') {
-        if (!confirm('Leave this group?')) return;
-        send({ type: 'group_leave',
-               groupId: group.id });
-      } else if (action === 'delete') {
-        if (!confirm('Delete this group?')) return;
-        alert('Group delete is not implemented on the server yet.');
+          wrap.style.cssText =
+            'display:flex;flex-direction:' +
+            'column;gap:4px';
+          group.members?.forEach(m => {
+            const row =
+              document.createElement('div');
+            row.className = 'member-row';
+            row.innerHTML = `
+              <span>${SC.esc(m.username)}</span>
+              ${m.id === group.creator_id
+                ? '<span style="color:var(--yellow)">creator</span>'
+                : ''}
+            `;
+            wrap.appendChild(row);
+          });
+          SC.ui.showModal(
+            `# ${group.name} — Members`, wrap);
+          break;
+        }
+
+        case 'kick': {
+          const wrap =
+            document.createElement('div');
+          group.members
+            ?.filter(m => m.id !== myUserId)
+            .forEach(m => {
+              const row =
+                document.createElement('div');
+              row.className = 'member-row';
+              row.innerHTML = `
+                <span>${SC.esc(m.username)}</span>
+                <button style="background:none;
+                  border:1px solid var(--red);
+                  color:var(--red);
+                  font-family:var(--font);
+                  font-size:11px;padding:2px 8px;
+                  cursor:pointer">
+                  Kick
+                </button>
+              `;
+              row.querySelector('button')
+                 .addEventListener('click', () => {
+                   send({
+                     type:     'group_kick',
+                     groupId:  group.id,
+                     username: m.username
+                   });
+                   SC.ui.hideModal();
+                 });
+              wrap.appendChild(row);
+            });
+          SC.ui.showModal(
+            `Kick from # ${group.name}`, wrap);
+          break;
+        }
+
+        case 'leave':
+          if (!confirm(
+            `Leave group "${group.name}"?`))
+            return;
+          send({
+            type:    'group_leave',
+            groupId: group.id
+          });
+          break;
+
+        case 'delete':
+          if (!confirm(
+            `Delete group "${group.name}"?\n` +
+            `This cannot be undone.`)) return;
+          send({
+            type:    'group_delete',
+            groupId: group.id
+          });
+          break;
       }
-    }
+    },
   }
 });

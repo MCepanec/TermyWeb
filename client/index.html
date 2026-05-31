@@ -7,6 +7,19 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="loading-screen" class="screen loading-screen">
+    <div class="loading-box">
+      <pre class="loading-banner" style="color:var(--accent)">
+ ╔══════════════════════════════════════╗
+ ║            Termy  v2.0               ║
+ ║    End-to-End Encrypted Messaging    ║
+ ╚══════════════════════════════════════╝</pre>
+      <div class="loading-status">
+        <span class="loading-dot"></span>
+        Resuming session...
+      </div>
+    </div>
+  </div>
   <!-- Auth Screen -->
   <div id="auth-screen" class="screen">
     <div class="auth-box">
@@ -222,6 +235,19 @@
 
   <input id="file-input" type="file" style="display:none">
 
+  <!-- Runs before page renders to prevent flash -->
+  <script>
+    (function() {
+      const token = localStorage.getItem(
+        'securechat_session');
+      if (token) {
+        // Has a token — show loading, hide auth
+        document.documentElement.dataset
+          .hasSession = '1';
+      }
+    })();
+  </script>
+
   <script type="module" src="crypto.js"></script>
   <script type="module" src="filetransfer.js"></script>
   <script type="module" src="voice.js"></script>
@@ -229,5 +255,6 @@
   <script type="module" src="app.js"></script>
   <script type="module" src="tiler.js"></script>
   <script type="module" src="app.js"></script>
+  <script type="module" src="ctx.js"></script>
 </body>
 </html>

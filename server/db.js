@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import * as db from './db.js';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const db = new DatabaseSync(
@@ -10,6 +11,15 @@ db.exec(`PRAGMA journal_mode = WAL`);
 db.exec(`PRAGMA foreign_keys = ON`);
 
 db.exec(`
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT    PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    created_at INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    UNIQUE NOT NULL,
@@ -34,14 +44,17 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS messages (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_id       INTEGER NOT NULL REFERENCES users(id),
-    to_id         INTEGER NOT NULL REFERENCES users(id),
-    ciphertext    TEXT    NOT NULL,
-    nonce         TEXT    NOT NULL,
-    ephemeral_pub TEXT    NOT NULL,
-    timestamp_unix INTEGER NOT NULL,
-    delivered     INTEGER NOT NULL DEFAULT 0
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id           INTEGER NOT NULL REFERENCES users(id),
+    to_id             INTEGER NOT NULL REFERENCES users(id),
+    ciphertext        TEXT    NOT NULL,
+    nonce             TEXT    NOT NULL,
+    ephemeral_pub     TEXT    NOT NULL,
+    self_ciphertext   TEXT,
+    self_nonce        TEXT,
+    self_ephemeral_pub TEXT,
+    timestamp_unix    INTEGER NOT NULL,
+    delivered         INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS groups (
@@ -106,6 +119,54 @@ db.exec(`
 
 // ── Helpers ────────────────────────────────────────────
 const stmt = (sql) => db.prepare(sql);
+
+// ── Sessions ───────────────────────────────────────────
+const SESSION_TTL = 30 * 24 * 60 * 60; // 30 days (seconds)
+
+export const createSession = (token, userId) => {
+  const now     = Math.floor(Date.now() / 1000);
+  const expires = now + SESSION_TTL;
+  stmt(`INSERT INTO sessions
+        (token, user_id, created_at,
+         last_seen, expires_at)
+        VALUES(?,?,?,?,?)`)
+    .run(token, userId, now, now, expires);
+};
+
+export const getSession = (token) => {
+  const now = Math.floor(Date.now() / 1000);
+  return stmt(`SELECT s.*, u.username,
+                        u.password_hash,
+                        u.public_key
+               FROM sessions s
+               JOIN users u ON u.id = s.user_id
+               WHERE s.token = ?
+                 AND s.expires_at > ?`)
+    .get(token, now);
+};
+
+export const refreshSession = (token) => {
+  const now     = Math.floor(Date.now() / 1000);
+  const expires = now + SESSION_TTL;
+  stmt(`UPDATE sessions
+        SET last_seen=?, expires_at=?
+        WHERE token=?`)
+    .run(now, expires, token);
+};
+
+export const deleteSession = (token) =>
+  stmt('DELETE FROM sessions WHERE token=?')
+    .run(token);
+
+export const deleteUserSessions = (userId) =>
+  stmt('DELETE FROM sessions WHERE user_id=?')
+    .run(userId);
+
+export const cleanExpiredSessions = () => {
+  const now = Math.floor(Date.now() / 1000);
+  stmt('DELETE FROM sessions WHERE expires_at < ?')
+    .run(now);
+};
 
 // ── Users ──────────────────────────────────────────────
 export const findUser = (username) =>
@@ -193,17 +254,25 @@ export const getFriends = (uid) =>
         WHERE f.user_id = ?`).all(uid);
 
 // ── Messages ───────────────────────────────────────────
-export const storeMessage = (from, to, ct,
-                              nonce, ephem, ts) =>
+export const storeMessage = (
+    from, to, ct, nonce, ephem, ts,
+    selfCt, selfNonce, selfEphem) =>
   stmt(`INSERT INTO messages
-        (from_id,to_id,ciphertext,nonce,
-         ephemeral_pub,timestamp_unix)
-        VALUES(?,?,?,?,?,?)`)
-    .run(from, to, ct, nonce, ephem, ts);
+        (from_id, to_id, ciphertext, nonce,
+         ephemeral_pub, self_ciphertext,
+         self_nonce, self_ephemeral_pub,
+         timestamp_unix)
+        VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run(from, to, ct, nonce, ephem,
+         selfCt ?? null, selfNonce ?? null,
+         selfEphem ?? null, ts);
 
-export const markMessagesDelivered = (uid) =>
+export const markSpecificMessagesDelivered =
+    (toId, fromId) =>
   stmt(`UPDATE messages SET delivered=1
-        WHERE to_id=? AND delivered=0`).run(uid);
+        WHERE to_id=? AND from_id=?
+          AND delivered=0`)
+    .run(toId, fromId);
 
 export const getOfflineMessages = (uid) =>
   stmt(`SELECT m.*, u.username as from_username
@@ -212,14 +281,38 @@ export const getOfflineMessages = (uid) =>
         WHERE m.to_id = ?
         ORDER BY m.timestamp_unix ASC`).all(uid);
 
-export const getDMHistory = (uid1, uid2, limit = 200) =>
-  stmt(`SELECT m.*, u.username as from_username
+export const getUnreadDMCounts = (uid) =>
+  stmt(`SELECT from_id, COUNT(*) as count,
+               u.username as from_username
+        FROM messages m
+        JOIN users u ON u.id = m.from_id
+        WHERE m.to_id = ?
+          AND m.delivered = 0
+        GROUP BY m.from_id`)
+    .all(uid);
+
+export const getUnreadGroupCounts = (uid) =>
+  stmt(`SELECT gm.group_id,
+               COUNT(*) as count,
+               g.name as group_name
+        FROM group_messages gm
+        JOIN groups g ON g.id = gm.group_id
+        WHERE gm.for_user_id = ?
+          AND gm.delivered = 0
+        GROUP BY gm.group_id`)
+    .all(uid);
+
+export const getDMHistory = (uid1, uid2,
+                              limit = 200) =>
+  stmt(`SELECT m.*,
+               u.username as from_username
         FROM messages m
         JOIN users u ON u.id = m.from_id
         WHERE (m.from_id=? AND m.to_id=?)
            OR (m.from_id=? AND m.to_id=?)
         ORDER BY m.timestamp_unix ASC
-        LIMIT ?`).all(uid1, uid2, uid2, uid1, limit);
+        LIMIT ?`)
+    .all(uid1, uid2, uid2, uid1, limit);
 
 export const getGroupHistory = (gid, uid, limit = 200) =>
   stmt(`SELECT DISTINCT m.group_id, m.from_id,
@@ -239,6 +332,12 @@ export const createGroup = (name, creatorId) => {
   stmt('INSERT OR IGNORE INTO group_members VALUES(?,?)')
     .run(r.lastInsertRowid, creatorId);
   return r.lastInsertRowid;
+};
+
+export const deleteGroup = (gid) => {
+  stmt('DELETE FROM group_members WHERE group_id=?').run(gid);
+  stmt('DELETE FROM group_messages WHERE group_id=?').run(gid);
+  stmt('DELETE FROM groups WHERE id=?').run(gid);
 };
 
 export const getGroup = (id) =>
@@ -290,6 +389,29 @@ export const getGroupOfflineMessages = (uid) =>
         ORDER BY timestamp_unix ASC`).all(uid);
 
 // ── File transfers ─────────────────────────────────────
+export const isFileReferenced = (url) => {
+  // Check DM messages (file shares stored as JSON
+  // in ciphertext with nonce='file')
+  const inDMs = stmt(`
+    SELECT 1 FROM messages
+    WHERE nonce='file'
+      AND ciphertext LIKE ?
+    LIMIT 1
+  `).get(`%${url}%`);
+  if (inDMs) return true;
+
+  // Check group messages
+  const inGroups = stmt(`
+    SELECT 1 FROM group_messages
+    WHERE nonce='file'
+      AND ciphertext LIKE ?
+    LIMIT 1
+  `).get(`%${url}%`);
+  if (inGroups) return true;
+
+  return false;
+};
+
 export const createFileTransfer = (tid, senderId,
     receiverId, groupId, filename, size) =>
   stmt(`INSERT INTO file_transfers VALUES(?,?,?,?,?,?,?)`)

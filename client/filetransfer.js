@@ -1,154 +1,56 @@
-const CHUNK_SIZE = 256 * 1024; // 256KB
+// Simplified file transfer — upload to server,
+// receive download link, render inline if media
 
-class FileTransferManager {
-  constructor() {
-    this.incoming = new Map(); // transferId → state
-    this.outgoing = new Map(); // transferId → state
-    this.fileKeys = new Map(); // transferId → CryptoKey
-  }
+const IMAGE_TYPES = new Set([
+  'image/jpeg','image/png','image/gif',
+  'image/webp','image/svg+xml','image/bmp'
+]);
 
-  // ── Sender ─────────────────────────────────────────
-  async offerFile(file, recipients, send) {
-    if (file.size > 1024 * 1024 * 1024)
-      throw new Error('File exceeds 1GB limit');
-
-    // Generate AES key for this transfer
-    const key    = await SC.crypto.generateFileKey();
-    const keyB64 = await SC.crypto.exportFileKey(key);
-
-    // Encrypt key for each recipient
-    const encKeys = await Promise.all(
-      recipients.map(async r => ({
-        userId: r.id,
-        encKey: await this._encryptKey(keyB64, r.public_key)
-      }))
-    );
-
-    // Store key locally — we send it to ourselves too
-    // so we can display progress
-    const localTid = 'pending_' + Date.now();
-    this.fileKeys.set(localTid, { key, file });
-
-    send({
-      type: 'file_offer',
-      filename:  file.name,
-      fileSize:  file.size,
-      encKeys
-    });
-
-    return localTid;
-  }
-
-  async _encryptKey(keyB64, recipientPubB64) {
-    // Encrypt the raw AES key string as a message
-    const bundle = await SC.crypto.encrypt(
-      keyB64, recipientPubB64);
-    return JSON.stringify(bundle);
-  }
-
-  onTransferAccepted(transferId, receiverId,
-                      file, send, onProgress) {
-    // Server confirmed recipient accepted —
-    // start sending chunks
-    this._sendChunks(transferId, receiverId,
-                     file, send, onProgress);
-  }
-
-  async _sendChunks(transferId, receiverId,
-                     file, send, onProgress) {
-    const key   = await SC.crypto.generateFileKey();
-    this.fileKeys.set(transferId, key);
-
-    const totalChunks =
-      Math.ceil(file.size / CHUNK_SIZE);
-    let chunkIdx = 0;
-
-    const sendNext = async () => {
-      if (chunkIdx >= totalChunks) return;
-      const start = chunkIdx * CHUNK_SIZE;
-      const end   = Math.min(start + CHUNK_SIZE,
-                             file.size);
-      const slice = file.slice(start, end);
-      const buf   = await slice.arrayBuffer();
-      const { data, nonce } =
-        await SC.crypto.encryptChunk(
-          new Uint8Array(buf), key);
-      const isLast = chunkIdx === totalChunks - 1;
-
-      send({
-        type: 'file_chunk',
-        transferId, receiverId, chunkIdx,
-        data, nonce, isLast
-      });
-
-      if (onProgress)
-        onProgress(end, file.size);
-
-      chunkIdx++;
-
-      // Wait for ack before next chunk
-      this.outgoing.set(transferId,
-        { waitingForAck: chunkIdx - 1,
-          sendNext, key });
-    };
-
-    this.outgoing.set(transferId,
-      { waitingForAck: -1, sendNext, key });
-    await sendNext();
-  }
-
-  onChunkAck(transferId, chunkIdx) {
-    const state = this.outgoing.get(transferId);
-    if (!state) return;
-    if (state.waitingForAck === chunkIdx)
-      state.sendNext();
-  }
-
-  // ── Receiver ───────────────────────────────────────
-  async acceptOffer(transferId, encKeyJson,
-                    filename, privateKey) {
-    // Decrypt AES key
-    const bundle = JSON.parse(encKeyJson);
-    const keyB64 = await SC.crypto.decrypt(
-      bundle.ciphertext, bundle.nonce,
-      bundle.ephemeralPub, privateKey);
-    const key = await SC.crypto.importFileKey(keyB64);
-
-    this.incoming.set(transferId, {
-      filename, chunks: [], key,
-      bytesReceived: 0
-    });
-  }
-
-  async onChunk(transferId, dataB64, nonceB64,
-                isLast, send, onProgress,
-                onComplete) {
-    const state = this.incoming.get(transferId);
-    if (!state) return;
-
-    const chunk = await SC.crypto.decryptChunk(
-      dataB64, nonceB64, state.key);
-    state.chunks.push(chunk);
-    state.bytesReceived += chunk.byteLength;
-
-    // Send ACK
-    send({
-      type: 'file_chunk_ack',
-      transferId,
-      chunkIdx: state.chunks.length - 1
-    });
-
-    if (onProgress)
-      onProgress(state.bytesReceived);
-
-    if (isLast) {
-      // Assemble and download
-      const blob = new Blob(state.chunks);
-      this.incoming.delete(transferId);
-      if (onComplete) onComplete(blob, state.filename);
-    }
-  }
-}
+const VIDEO_TYPES = new Set([
+  'video/mp4','video/webm','video/ogg',
+  'video/quicktime'
+]);
 
 window.SC = window.SC || {};
-window.SC.ft = new FileTransferManager();
+
+window.SC.ft = {
+  // Upload a file, return {url, filename, size, mimetype}
+  async upload(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr  = new XMLHttpRequest();
+      const form = new FormData();
+      form.append('file', file);
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && onProgress)
+          onProgress(e.loaded, e.total);
+      };
+
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            reject(new Error('Bad response'));
+          }
+        } else {
+          reject(new Error(`Upload failed: ${xhr.status}`));
+        }
+      };
+
+      xhr.onerror = () =>
+        reject(new Error('Upload error'));
+
+      xhr.open('POST', '/upload');
+      xhr.send(form);
+    });
+  },
+
+  isImage(mimetype) {
+    return IMAGE_TYPES.has(mimetype);
+  },
+
+  isVideo(mimetype) {
+    return VIDEO_TYPES.has(mimetype);
+  }
+};

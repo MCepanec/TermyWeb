@@ -70,30 +70,16 @@ class TileManager {
     if (el) _appendMsg(el, msg);
   }
 
+  appendFile(panelId, fileMsg) {
+    const el = this._msgEl(panelId);
+    if (el) _appendFile(el, fileMsg);
+  }
+
   appendSystem(panelId, text) {
     this.appendMessage(panelId, {
       timestamp: Math.floor(Date.now() / 1000),
       author: '*', text, system: true
     });
-  }
-
-  showFileOffer(panelId, offer, onAccept, onReject) {
-    const el = this._foEl(panelId);
-    if (el) _addFileOffer(el, offer, onAccept, onReject);
-  }
-
-  updateFileProgress(transferId, done, total) {
-    const fill = this.root.querySelector(
-      `.fo-progress-fill[data-tid="${transferId}"]`);
-    if (!fill) return;
-    const pct = total > 0
-      ? Math.round(done * 100 / total) : 0;
-    fill.style.width = pct + '%';
-    if (pct >= 100)
-      setTimeout(() => {
-        const row = fill.closest('.t-file-offer');
-        if (row) row.remove();
-      }, 1500);
   }
 
   findPanel(type, chatId) {
@@ -317,7 +303,6 @@ class TileManager {
           </div>
         </div>
         <div class="t-messages"></div>
-        <div class="t-file-offers"></div>
         <div class="t-input-row">
           <input class="t-input" type="text"
                  placeholder="Message..."
@@ -381,17 +366,89 @@ class TileManager {
         if (e.key === 'Enter') doSend();
       };
 
-      // Right-click context menu for groups
-      if (isGroup) {
-        el.addEventListener('contextmenu', (e) => {
-          // Only if target is not an input/button
-          if (e.target.matches(
-              'input,button,.t-input-row *'))
-            return;
-          e.preventDefault();
-          this._showGroupCtx(e, panel);
+    // Right-click context menu for groups
+    if (isGroup) {
+      // Header buttons (invite, members, kick)
+      el.querySelectorAll(
+        '.tile-hbtn[data-action]')
+        .forEach(btn => {
+          const action = btn.dataset.action;
+          if (action === 'group-ctx') return;
+          btn.addEventListener('click', e => {
+            e.stopPropagation();
+            window.SC.app?.onGroupAction(
+              panel, action);
+          });
+        });
+
+      // ⋮ button and right-click both
+      // show the same context menu
+      const buildGroupCtxItems = () => [
+        { header: '# ' + panel.title },
+        {
+          icon:   '+',
+          label:  'Invite',
+          action: () =>
+            window.SC.app?.onGroupAction(
+              panel, 'invite')
+        },
+        {
+          icon:   '👥',
+          label:  'Members',
+          action: () =>
+            window.SC.app?.onGroupAction(
+              panel, 'members')
+        },
+        {
+          icon:   '✕',
+          label:  'Kick Member',
+          action: () =>
+            window.SC.app?.onGroupAction(
+              panel, 'kick')
+        },
+        { sep: true },
+        {
+          icon:   '→',
+          label:  'Leave Group',
+          cls:    'danger',
+          action: () =>
+            window.SC.app?.onGroupAction(
+              panel, 'leave')
+        },
+        {
+          icon:   '🗑',
+          label:  'Delete Group',
+          cls:    'danger',
+          action: () =>
+            window.SC.app?.onGroupAction(
+              panel, 'delete')
+        }
+      ];
+
+      const ctxBtn =
+        el.querySelector('.tile-ctx-btn');
+      if (ctxBtn) {
+        ctxBtn.addEventListener('click', e => {
+          e.stopPropagation();
+          const r = ctxBtn.getBoundingClientRect();
+          SC.ctx.show(
+            r.left, r.bottom + 4,
+            buildGroupCtxItems());
         });
       }
+
+      // Right-click anywhere on panel
+      // except message area
+      el.addEventListener('contextmenu', e => {
+        if (e.target.closest('.tile-messages'))
+          return;
+        e.preventDefault();
+        e.stopPropagation();
+        SC.ctx.show(
+          e.clientX, e.clientY,
+          buildGroupCtxItems());
+      });
+    }
 
       root.appendChild(el);
       this._ro.observe(el);
@@ -669,55 +726,99 @@ function _appendMsg(el, msg) {
   el.scrollTop = el.scrollHeight;
 }
 
-// ── File offer rendering ──────────────────────────────────
+function _appendFile(el, msg) {
+  const d    = new Date((msg.timestamp ?? 0) * 1000);
+  const date = d.toLocaleDateString();
 
-function _addFileOffer(container, offer,
-                        onAccept, onReject) {
-  if (container.querySelector(
-      `[data-tid="${offer.transferId}"]`)) return;
+  if (el.dataset.lastDate !== date) {
+    el.dataset.lastDate = date;
+    const sep = document.createElement('div');
+    sep.className   = 'date-sep';
+    sep.textContent = date;
+    el.appendChild(sep);
+  }
+
+  const time = d.toLocaleTimeString([], {
+    hour: '2-digit', minute: '2-digit' });
 
   const row = document.createElement('div');
-  row.className   = 't-file-offer';
-  row.dataset.tid = offer.transferId;
-  row.innerHTML = `
-    <div class="chat-file-offer-info">
-      <span class="chat-file-offer-from">
-        [file] ${esc(offer.fromUser)}
-      </span>
-      <span class="chat-file-offer-name">
-        ${esc(offer.filename)}
-      </span>
-      <span class="chat-file-offer-size">
-        ${formatBytes(offer.fileSize)}
-      </span>
-      <div class="fo-progress" style="display:none">
-        <div class="fo-progress-fill"
-             data-tid="${offer.transferId}">
+  row.className = 'msg msg-file';
+
+  const isImage = SC.ft.isImage(msg.mimetype);
+  const isVideo = SC.ft.isVideo(msg.mimetype);
+  const fullUrl = msg.url.startsWith('http')
+    ? msg.url : location.origin + msg.url;
+
+  let mediaHtml = '';
+
+  if (isImage) {
+    mediaHtml = `
+      <div class="file-media">
+        <img src="${fullUrl}"
+             alt="${esc(msg.filename)}"
+             class="file-img"
+             loading="lazy"
+             onclick="window.open('${fullUrl}','_blank')">
+        <div class="file-dl">
+          <a href="${fullUrl}"
+             download="${esc(msg.filename)}"
+             class="file-dl-btn">
+            ↓ Download
+          </a>
         </div>
       </div>
-    </div>
-    <div class="chat-file-offer-actions">
-      <button class="accept">Accept</button>
-      <button class="reject">Reject</button>
-    </div>
+    `;
+  } else if (isVideo) {
+    mediaHtml = `
+      <div class="file-media">
+        <video controls
+               class="file-video"
+               preload="metadata">
+          <source src="${fullUrl}"
+                  type="${esc(msg.mimetype)}">
+        </video>
+        <div class="file-dl">
+          <a href="${fullUrl}"
+             download="${esc(msg.filename)}"
+             class="file-dl-btn">
+            ↓ Download
+          </a>
+        </div>
+      </div>
+    `;
+  } else {
+    // Generic file — download only
+    mediaHtml = `
+      <div class="file-attachment">
+        <span class="file-icon">📄</span>
+        <div class="file-info">
+          <span class="file-name">
+            ${esc(msg.filename)}
+          </span>
+          <span class="file-size">
+            ${formatBytes(msg.size)}
+          </span>
+        </div>
+        <a href="${fullUrl}"
+           download="${esc(msg.filename)}"
+           class="file-dl-btn">
+          ↓ Download
+        </a>
+      </div>
+    `;
+  }
+
+  row.innerHTML = `
+    <span class="msg-time">${time}</span>
+    <span class="msg-author
+      ${msg.isSelf ? 'self' : 'other'}">
+      ${esc(msg.fromUser)}
+    </span>
+    <span class="msg-text">${mediaHtml}</span>
   `;
 
-  row.querySelector('.accept').onclick = () => {
-    row.querySelector('.accept').textContent =
-      'Receiving...';
-    row.querySelector('.accept').disabled = true;
-    row.querySelector('.reject').disabled = true;
-    row.querySelector('.fo-progress')
-       .style.display = 'block';
-    onAccept(offer, row);
-  };
-
-  row.querySelector('.reject').onclick = () => {
-    onReject(offer);
-    row.remove();
-  };
-
-  container.appendChild(row);
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
 }
 
 // ── Utilities ─────────────────────────────────────────────
