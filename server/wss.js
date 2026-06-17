@@ -1,6 +1,7 @@
 import { WebSocketServer } from 'ws';
 import { v4 as uuid }      from 'uuid';
 import { hashPassword, verifyPassword } from './auth.js';
+import * as DB from './db.js';
 
 // ── Online users ───────────────────────────────────────────
 // Map<userId, ws>
@@ -130,7 +131,7 @@ export function setupWSS(server) {
         }
       }
 
-      const friends = db.getFriends(ws.userId);
+      const friends = DB.getFriends(ws.userId);
       broadcast(friends.map(f => f.id), {
         type:     'presence',
         userId:   ws.userId,
@@ -169,16 +170,16 @@ async function handleMessage(ws, msg) {
         msg:  'Password must be 8-128 characters'
       });
 
-    if (db.findUser(username))
+    if (DB.findUser(username))
       return send(ws, {
         type: 'register_resp', ok: false,
         msg:  'Username already taken'
       });
 
     const hash = await hashPassword(password);
-    db.createUser(username, hash);
-    const user = db.findUser(username);
-    if (publicKey) db.setPublicKey(user.id, publicKey);
+    DB.createUser(username, hash);
+    const user = DB.findUser(username);
+    if (publicKey) DB.setPublicKey(user.id, publicKey);
 
     return send(ws, {
       type: 'register_resp', ok: true,
@@ -202,7 +203,7 @@ async function handleMessage(ws, msg) {
         msg:  'Missing credentials'
       });
 
-    const user = db.findUser(username);
+    const user = DB.findUser(username);
     const dummyHash =
       '$2a$12$dummyhashtopreventtimingattack' +
       'onusernameenumeration000000';
@@ -230,9 +231,9 @@ async function handleMessage(ws, msg) {
 
     // After setPublicKey in login handler:
     if (publicKey) {
-      db.setPublicKey(user.id, publicKey);
+      DB.setPublicKey(user.id, publicKey);
       // Tell online friends the key may have changed
-      const friends = db.getFriends(user.id);
+      const friends = DB.getFriends(user.id);
       broadcast(friends.map(f => f.id), {
         type:      'public_key_resp',
         userId:    user.id,
@@ -242,7 +243,7 @@ async function handleMessage(ws, msg) {
 
     // Create session token
     const token = uuid() + uuid(); // 72 char random token
-    db.createSession(token, user.id);
+    DB.createSession(token, user.id);
 
     ws.userId    = user.id;
     ws.username  = user.username;
@@ -260,14 +261,14 @@ async function handleMessage(ws, msg) {
 
     deliverOffline(ws, user.id);
 
-    const pendingReqs = db.getFriendRequests(user.id);
+    const pendingReqs = DB.getFriendRequests(user.id);
     if (pendingReqs.length > 0)
       send(ws, {
         type:     'friend_requests_resp',
         requests: pendingReqs
       });
 
-    const friends = db.getFriends(user.id);
+    const friends = DB.getFriends(user.id);
     broadcast(friends.map(f => f.id), {
       type:     'presence',
       userId:   user.id,
@@ -284,14 +285,12 @@ async function handleMessage(ws, msg) {
       type: 'session_resp', ok: false
     });
 
-    const session = db.getSession(token);
+    const session = DB.getSession(token);
     if (!session) return send(ws, {
       type: 'session_resp', ok: false,
       msg:  'Session expired'
     });
 
-    // Kick existing connection only if it's
-    // a DIFFERENT socket (not same tab refreshing)
     const existing = online.get(session.user_id);
     if (existing && existing !== ws) {
       send(existing, {
@@ -302,17 +301,11 @@ async function handleMessage(ws, msg) {
       existing.userId = null;
     }
 
-    db.refreshSession(token);
-    if (publicKey) {
-      db.setPublicKey(user.id, publicKey);
-      // Tell online friends the key may have changed
-      const friends = db.getFriends(user.id);
-      broadcast(friends.map(f => f.id), {
-        type:      'public_key_resp',
-        userId:    user.id,
-        publicKey: publicKey
-      });
-    }
+    DB.refreshSession(token);
+
+    // THIS LINE — must use session.user_id not user.id
+    if (publicKey)
+      DB.setPublicKey(session.user_id, publicKey);
 
     ws.userId       = session.user_id;
     ws.username     = session.username;
@@ -331,14 +324,14 @@ async function handleMessage(ws, msg) {
     deliverOffline(ws, session.user_id);
 
     const pendingReqs =
-      db.getFriendRequests(session.user_id);
+      DB.getFriendRequests(session.user_id);
     if (pendingReqs.length > 0)
       send(ws, {
         type:     'friend_requests_resp',
         requests: pendingReqs
       });
 
-    const friends = db.getFriends(session.user_id);
+    const friends = DB.getFriends(session.user_id);
     broadcast(friends.map(f => f.id), {
       type:     'presence',
       userId:   session.user_id,
@@ -358,7 +351,7 @@ async function handleMessage(ws, msg) {
 
   if (type === 'logout') {
     if (ws.sessionToken)
-      db.deleteSession(ws.sessionToken);
+      DB.deleteSession(ws.sessionToken);
 
     if (ws.userId)
       online.delete(ws.userId);
@@ -374,7 +367,7 @@ async function handleMessage(ws, msg) {
 
   // ── Friends ──────────────────────────────────────────────
   if (type === 'friend_list') {
-    const friends = db.getFriends(ws.userId).map(f => ({
+    const friends = DB.getFriends(ws.userId).map(f => ({
       ...f, online: online.has(f.id)
     }));
     return send(ws, { type: 'friend_list_resp', friends });
@@ -382,7 +375,7 @@ async function handleMessage(ws, msg) {
 
   // ── Friend requests ──────────────────────────────────────
   if (type === 'send_friend_request') {
-    const target = db.findUser(msg.username);
+    const target = DB.findUser(msg.username);
     if (!target)
       return send(ws, {
         type: 'friend_req_resp', ok: false,
@@ -393,18 +386,18 @@ async function handleMessage(ws, msg) {
         type: 'friend_req_resp', ok: false,
         msg:  'Cannot add yourself'
       });
-    if (db.areFriends(ws.userId, target.id))
+    if (DB.areFriends(ws.userId, target.id))
       return send(ws, {
         type: 'friend_req_resp', ok: false,
         msg:  'Already friends'
       });
-    if (db.hasPendingRequest(ws.userId, target.id))
+    if (DB.hasPendingRequest(ws.userId, target.id))
       return send(ws, {
         type: 'friend_req_resp', ok: false,
         msg:  'Request already sent'
       });
 
-    db.sendFriendRequest(ws.userId, target.id);
+    DB.sendFriendRequest(ws.userId, target.id);
     send(ws, {
       type: 'friend_req_resp', ok: true,
       msg:  `Friend request sent to ${msg.username}`
@@ -422,7 +415,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'get_public_key') {
-    const targetUser = db.findUserById(msg.userId);
+    const targetUser = DB.findUserById(msg.userId);
     return send(ws, {
       type:      'public_key_resp',
       userId:    msg.userId,
@@ -431,7 +424,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'get_friend_requests') {
-    const reqs = db.getFriendRequests(ws.userId);
+    const reqs = DB.getFriendRequests(ws.userId);
     return send(ws, {
       type:     'friend_requests_resp',
       requests: reqs
@@ -439,7 +432,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'accept_friend_request') {
-    const req = db.acceptFriendRequest(
+    const req = DB.acceptFriendRequest(
       msg.reqId, ws.userId);
     if (!req)
       return send(ws, {
@@ -463,7 +456,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'decline_friend_request') {
-    db.declineFriendRequest(msg.reqId, ws.userId);
+    DB.declineFriendRequest(msg.reqId, ws.userId);
     return send(ws, {
       type: 'friend_req_action_resp',
       ok:   true, action: 'declined'
@@ -471,7 +464,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'remove_friend') {
-    db.removeFriend(ws.userId, msg.friendId);
+    DB.removeFriend(ws.userId, msg.friendId);
     return send(ws, {
       type:     'remove_friend_resp',
       ok:       true,
@@ -491,7 +484,7 @@ async function handleMessage(ws, msg) {
 
     const ts = timestamp ?? Math.floor(Date.now() / 1000);
 
-    db.storeMessage(
+    DB.storeMessage(
       ws.userId, toId,
       ciphertext, nonce, ephemeralPub, ts,
       selfCiphertext, selfNonce, selfEphemeralPub);
@@ -512,10 +505,10 @@ async function handleMessage(ws, msg) {
 
   if (type === 'dm_history') {
     // Mark messages as delivered when chat is opened
-    db.markSpecificMessagesDelivered(
+    DB.markSpecificMessagesDelivered(
       ws.userId, msg.withId);
 
-    const msgs = db.getDMHistory(
+    const msgs = DB.getDMHistory(
       ws.userId, msg.withId, 200);
 
     const mapped = msgs.map(m => {
@@ -556,7 +549,7 @@ async function handleMessage(ws, msg) {
               '(letters, numbers, spaces, _ -)'
       });
     try {
-      const id = db.createGroup(msg.name, ws.userId);
+      const id = DB.createGroup(msg.name, ws.userId);
       send(ws, {
         type:    'group_create_resp',
         ok:      true,
@@ -573,18 +566,18 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'group_invite') {
-    if (!db.isGroupMember(msg.groupId, ws.userId))
+    if (!DB.isGroupMember(msg.groupId, ws.userId))
       return send(ws, {
         type: 'group_invite_resp', ok: false,
         msg:  'Not a member'
       });
-    const target = db.findUser(msg.username);
+    const target = DB.findUser(msg.username);
     if (!target)
       return send(ws, {
         type: 'group_invite_resp', ok: false,
         msg:  'User not found'
       });
-    db.addGroupMember(msg.groupId, target.id);
+    DB.addGroupMember(msg.groupId, target.id);
     send(ws, {
       type: 'group_invite_resp', ok: true,
       msg:  `${msg.username} invited`
@@ -594,41 +587,41 @@ async function handleMessage(ws, msg) {
       send(targetWs, {
         type:    'group_invited',
         groupId: msg.groupId,
-        name:    db.getGroup(msg.groupId)?.name
+        name:    DB.getGroup(msg.groupId)?.name
       });
     return;
   }
 
   if (type === 'group_list') {
-    const groups = db.getGroupsForUser(ws.userId)
+    const groups = DB.getGroupsForUser(ws.userId)
       .map(g => ({
         ...g,
-        members: db.getGroupMembers(g.id)
+        members: DB.getGroupMembers(g.id)
       }));
     return send(ws, { type: 'group_list_resp', groups });
   }
 
   if (type === 'group_leave') {
-    db.removeGroupMember(msg.groupId, ws.userId);
+    DB.removeGroupMember(msg.groupId, ws.userId);
     return send(ws, {
       type: 'group_leave_resp', ok: true
     });
   }
 
   if (type === 'group_kick') {
-    const group = db.getGroup(msg.groupId);
+    const group = DB.getGroup(msg.groupId);
     if (!group || group.creator_id !== ws.userId)
       return send(ws, {
         type: 'group_kick_resp', ok: false,
         msg:  'Not the group creator'
       });
-    const target = db.findUser(msg.username);
+    const target = DB.findUser(msg.username);
     if (!target)
       return send(ws, {
         type: 'group_kick_resp', ok: false,
         msg:  'User not found'
       });
-    db.removeGroupMember(msg.groupId, target.id);
+    DB.removeGroupMember(msg.groupId, target.id);
     const targetWs = online.get(target.id);
     if (targetWs)
       send(targetWs, {
@@ -643,14 +636,14 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'group_delete') {
-    const group = db.getGroup(msg.groupId);
+    const group = DB.getGroup(msg.groupId);
     if (!group || group.creator_id !== ws.userId)
       return send(ws, {
         type: 'group_delete_resp', ok: false,
         msg:  'Not the group creator'
       });
-    const members = db.getGroupMembers(msg.groupId);
-    db.deleteGroup(msg.groupId);
+    const members = DB.getGroupMembers(msg.groupId);
+    DB.deleteGroup(msg.groupId);
     // Notify all members
     for (const m of members) {
       if (m.id === ws.userId) continue;
@@ -671,7 +664,7 @@ async function handleMessage(ws, msg) {
 
   if (type === 'group_send_msg') {
     const { groupId, recipients, timestamp } = msg;
-    if (!db.isGroupMember(groupId, ws.userId))
+    if (!DB.isGroupMember(groupId, ws.userId))
       return send(ws, {
         type: 'group_msg_ack', ok: false
       });
@@ -682,7 +675,7 @@ async function handleMessage(ws, msg) {
       if (r.userId === ws.userId) continue;
 
       // Always store for history
-      db.storeGroupMessage(
+      DB.storeGroupMessage(
         groupId, ws.userId, ws.username, r.userId,
         r.ciphertext, r.nonce, r.ephemeralPub, ts);
 
@@ -706,7 +699,7 @@ async function handleMessage(ws, msg) {
   if (type === 'group_history') {
     // getGroupHistory already filters by for_user_id
     // so each user only gets rows encrypted for them
-    const msgs = db.getGroupHistory(
+    const msgs = DB.getGroupHistory(
       msg.groupId, ws.userId, 200);
 
     // Normalise column names for client
@@ -750,9 +743,9 @@ async function handleMessage(ws, msg) {
     };
 
     if (groupId) {
-      if (!db.isGroupMember(groupId, ws.userId))
+      if (!DB.isGroupMember(groupId, ws.userId))
         return;
-      const members = db.getGroupMembers(groupId);
+      const members = DB.getGroupMembers(groupId);
       for (const m of members) {
         if (m.id === ws.userId) continue;
         const tw = online.get(m.id);
@@ -760,7 +753,7 @@ async function handleMessage(ws, msg) {
           send(tw, { ...payload, groupId });
         } else {
           // Store as offline message
-          db.storeMessage(
+          DB.storeMessage(
             ws.userId, m.id,
             JSON.stringify({
               fileShare: true,
@@ -774,7 +767,7 @@ async function handleMessage(ws, msg) {
       if (tw) {
         send(tw, payload);
       } else {
-        db.storeMessage(
+        DB.storeMessage(
           ws.userId, toId,
           JSON.stringify({
             fileShare: true,
@@ -794,7 +787,7 @@ async function handleMessage(ws, msg) {
         msg:  'Invalid name'
       });
     try {
-      const id = db.createVChat(msg.name, ws.userId);
+      const id = DB.createVChat(msg.name, ws.userId);
       send(ws, {
         type:    'vchat_create_resp',
         ok:      true,
@@ -811,18 +804,18 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'vchat_invite') {
-    if (!db.isVChatMember(msg.vchatId, ws.userId))
+    if (!DB.isVChatMember(msg.vchatId, ws.userId))
       return send(ws, {
         type: 'vchat_invite_resp', ok: false,
         msg:  'Not a member'
       });
-    const target = db.findUser(msg.username);
+    const target = DB.findUser(msg.username);
     if (!target)
       return send(ws, {
         type: 'vchat_invite_resp', ok: false,
         msg:  'User not found'
       });
-    db.addVChatMember(msg.vchatId, target.id);
+    DB.addVChatMember(msg.vchatId, target.id);
     send(ws, {
       type: 'vchat_invite_resp', ok: true,
       msg:  `${msg.username} invited`
@@ -832,13 +825,13 @@ async function handleMessage(ws, msg) {
       send(targetWs, {
         type:    'vchat_invited',
         vchatId: msg.vchatId,
-        name:    db.getVChat(msg.vchatId)?.name
+        name:    DB.getVChat(msg.vchatId)?.name
       });
     return;
   }
 
   if (type === 'vchat_list') {
-    const vchats = db.getVChatsForUser(ws.userId)
+    const vchats = DB.getVChatsForUser(ws.userId)
       .map(v => ({
         ...v,
         activeCount: activeVChats.get(v.id)?.size ?? 0
@@ -847,7 +840,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'vchat_join') {
-    if (!db.isVChatMember(msg.vchatId, ws.userId))
+    if (!DB.isVChatMember(msg.vchatId, ws.userId))
       return send(ws, {
         type: 'vchat_join_resp', ok: false,
         msg:  'Not a member'
@@ -857,7 +850,7 @@ async function handleMessage(ws, msg) {
       activeVChats.set(msg.vchatId, new Set());
     activeVChats.get(msg.vchatId).add(ws.userId);
 
-    const members = db.getVChatMembers(msg.vchatId);
+    const members = DB.getVChatMembers(msg.vchatId);
     const active  = [...(activeVChats.get(msg.vchatId))]
       .map(uid => members.find(m => m.id === uid))
       .filter(Boolean);
@@ -866,7 +859,7 @@ async function handleMessage(ws, msg) {
       type:    'vchat_join_resp',
       ok:      true,
       vchatId: msg.vchatId,
-      name:    db.getVChat(msg.vchatId)?.name,
+      name:    DB.getVChat(msg.vchatId)?.name,
       active
     });
 
@@ -924,7 +917,7 @@ async function handleMessage(ws, msg) {
       }
     }
     // Remove from room membership entirely
-    db.removeVChatMember(msg.vchatId, ws.userId);
+    DB.removeVChatMember(msg.vchatId, ws.userId);
     return send(ws, {
       type:    'vchat_leave_room_resp',
       ok:      true,
@@ -933,7 +926,7 @@ async function handleMessage(ws, msg) {
   }
 
   if (type === 'vchat_delete') {
-    const vchat = db.getVChat(msg.vchatId);
+    const vchat = DB.getVChat(msg.vchatId);
     if (!vchat || vchat.creator_id !== ws.userId)
       return send(ws, {
         type: 'vchat_delete_resp', ok: false,
@@ -952,16 +945,16 @@ async function handleMessage(ws, msg) {
       }
       activeVChats.delete(msg.vchatId);
     }
-    db.deleteVChat(msg.vchatId);
+    DB.deleteVChat(msg.vchatId);
     return send(ws, {
       type: 'vchat_delete_resp', ok: true
     });
   }
 
   if (type === 'vchat_members') {
-    if (!db.isVChatMember(msg.vchatId, ws.userId))
+    if (!DB.isVChatMember(msg.vchatId, ws.userId))
       return;
-    const members = db.getVChatMembers(msg.vchatId);
+    const members = DB.getVChatMembers(msg.vchatId);
     const active  = activeVChats.get(msg.vchatId)
                     ?? new Set();
     return send(ws, {
@@ -1013,7 +1006,7 @@ async function handleMessage(ws, msg) {
 function deliverOffline(ws, uid) {
   // Send unread counts per sender so badges
   // show correctly without duplicating history
-  const unreadDMs = db.getUnreadDMCounts(uid);
+  const unreadDMs = DB.getUnreadDMCounts(uid);
   if (unreadDMs.length > 0)
     send(ws, {
       type:   'unread_counts',
@@ -1021,7 +1014,7 @@ function deliverOffline(ws, uid) {
     });
 
   const unreadGroups =
-    db.getUnreadGroupCounts(uid);
+    DB.getUnreadGroupCounts(uid);
   if (unreadGroups.length > 0)
     send(ws, {
       type:   'unread_counts',
@@ -1029,7 +1022,7 @@ function deliverOffline(ws, uid) {
     });
 
   // File offers still need full delivery
-  const offers = db.getOfflineFileOffers(uid);
+  const offers = DB.getOfflineFileOffers(uid);
   for (const o of offers) {
     send(ws, {
       type:      'file_offer',
@@ -1043,5 +1036,5 @@ function deliverOffline(ws, uid) {
       isHistory: true
     });
   }
-  if (offers.length) db.deleteOfflineFileOffers(uid);
+  if (offers.length) DB.deleteOfflineFileOffers(uid);
 }

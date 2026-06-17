@@ -1,57 +1,71 @@
+// ── SecureChat Voice Manager ───────────────────────────────
+// WebRTC mesh — one RTCPeerConnection per peer pair.
+// Audio playback uses HTMLAudioElement only.
+// VU meter uses a separate AnalyserNode per stream.
+// The two paths never share an AudioContext destination,
+// which was the root cause of audio cutting out when
+// the local mic was activated.
+
 class VoiceManager {
   constructor() {
     this.vchatId    = null;
-    this.peers      = new Map(); // userId → pc
-    this.stream     = null;
+    this.peers      = new Map(); // userId → RTCPeerConnection
+    this.stream     = null;      // local mic stream
     this.muted      = false;
     this.deafened   = false;
-    this.analyser   = null;
-    this.audioCtx   = null;
-    this.onVU       = null;
-    this.send       = null;
     this.myUserId   = null;
     this.myUsername = null;
+    this.send       = null;
+    this.onVU       = null;
     this.vuInterval = null;
-    this.speakers   = new Map();
-    // Keep audio elements alive — prevent GC
-    this._audioEls  = new Set();
+
+    // Per-speaker state
+    // userId → { username, audioEl, analyser,
+    //            audioCtx, muted, deafened }
+    this.speakers = new Map();
+
+    // Keep audio elements alive (prevent GC)
+    this._audioEls = new Set();
   }
 
+  // ── Join ──────────────────────────────────────────────
   async join(vchatId, myUserId, myUsername, send) {
     this.vchatId    = vchatId;
     this.myUserId   = myUserId;
     this.myUsername = myUsername;
     this.send       = send;
 
-    // Get microphone
     try {
       this.stream = await navigator.mediaDevices
-        .getUserMedia({ audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl:  true
-        }, video: false });
+        .getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl:  true
+          },
+          video: false
+        });
     } catch (err) {
       console.error('[voice] Mic error:', err);
       throw err;
     }
 
-    // AudioContext — resume if suspended
-    this.audioCtx = new AudioContext();
-    if (this.audioCtx.state === 'suspended')
-      await this.audioCtx.resume();
-
-    const src = this.audioCtx
+    // Local VU — own AudioContext just for analysis
+    const localCtx = new AudioContext();
+    await localCtx.resume();
+    const localSrc = localCtx
       .createMediaStreamSource(this.stream);
-    this.analyser = this.audioCtx.createAnalyser();
-    this.analyser.fftSize = 256;
-    src.connect(this.analyser);
-    // Don't connect to destination — avoids
-    // hearing yourself
+    const localAn  = localCtx.createAnalyser();
+    localAn.fftSize = 256;
+    localSrc.connect(localAn);
+    // Do NOT connect to localCtx.destination
+    // (we don't want to hear ourselves)
 
     this.speakers.set(myUserId, {
       username: myUsername,
-      analyser: this.analyser,
+      audioEl:  null,   // no playback for self
+      analyser: localAn,
+      audioCtx: localCtx,
       muted:    false,
       deafened: false
     });
@@ -60,6 +74,7 @@ class VoiceManager {
       () => this._pollVU(), 100);
   }
 
+  // ── Create peer connection ────────────────────────────
   _createPC(userId) {
     const pc = new RTCPeerConnection({
       iceServers: [
@@ -70,60 +85,73 @@ class VoiceManager {
 
     // Add local tracks
     if (this.stream) {
-      this.stream.getTracks().forEach(track => {
-        pc.addTrack(track, this.stream);
-      });
+      this.stream.getTracks().forEach(track =>
+        pc.addTrack(track, this.stream));
     }
 
+    // ICE candidates
     pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        this.send({
-          type:    'vchat_signal',
-          toId:    userId,
-          vchatId: this.vchatId,
-          signal:  { ice: ev.candidate.toJSON() }
-        });
-      }
+      if (!ev.candidate) return;
+      this.send({
+        type:    'vchat_signal',
+        toId:    userId,
+        vchatId: this.vchatId,
+        signal:  { ice: ev.candidate.toJSON() }
+      });
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`[voice] PC ${userId}:`,
+      console.log(`[voice] ${userId}:`,
         pc.connectionState);
     };
 
+    // ── Remote track arrives ──────────────────────────
     pc.ontrack = (ev) => {
-      console.log('[voice] Got track from', userId);
-      const stream = ev.streams[0];
-      if (!stream) return;
+      // Guard: ignore if we already set up audio
+      // for this peer from a previous ontrack call
+      const existing = this.speakers.get(userId);
+      if (existing?.audioEl) return;
 
-      // Create audio element and keep reference
+      console.log('[voice] Track from', userId);
+
+      const remoteStream =
+        ev.streams[0] ?? new MediaStream([ev.track]);
+
+      // ── Playback via Audio element ─────────────────
+      // This is the ONLY audio output path.
+      // AudioContext is NOT used for output — only
+      // for VU meter analysis below.
       const audio = new Audio();
-      audio.srcObject = stream;
+      audio.srcObject = remoteStream;
       audio.autoplay  = true;
-      // Mute if deafened
-      audio.muted = this.deafened;
+      audio.muted     = this.deafened;
       this._audioEls.add(audio);
+
       audio.play().catch(e =>
         console.warn('[voice] play():', e));
 
-      // VU analyser for this remote peer
-      const srcNode = this.audioCtx
-        .createMediaStreamSource(stream);
-      const an = this.audioCtx.createAnalyser();
-      an.fftSize = 256;
-      srcNode.connect(an);
-      if (!this.deafened)
-        srcNode.connect(this.audioCtx.destination);
+      // ── VU analysis via separate AudioContext ──────
+      // Completely independent from playback —
+      // no shared destination, no routing conflicts.
+      const vuCtx = new AudioContext();
+      vuCtx.resume().catch(() => {});
 
-      // Update or create speaker entry
-      const existing = this.speakers.get(userId);
+      const vuSrc = vuCtx
+        .createMediaStreamSource(remoteStream);
+      const vuAn  = vuCtx.createAnalyser();
+      vuAn.fftSize = 256;
+      vuSrc.connect(vuAn);
+      // Do NOT connect vuSrc to vuCtx.destination —
+      // audio plays via the Audio element above
+
+      const spk = this.speakers.get(userId);
       this.speakers.set(userId, {
-        username: existing?.username ?? String(userId),
-        analyser: an,
-        srcNode,
+        username: spk?.username ?? String(userId),
         audioEl:  audio,
-        muted:    existing?.muted    ?? false,
-        deafened: existing?.deafened ?? false
+        analyser: vuAn,
+        audioCtx: vuCtx,
+        muted:    spk?.muted    ?? false,
+        deafened: spk?.deafened ?? false
       });
     };
 
@@ -131,20 +159,27 @@ class VoiceManager {
     return pc;
   }
 
-  async connectToPeer(userId, username,
-                       isInitiator) {
+  // ── Connect to peer ───────────────────────────────────
+  async connectToPeer(userId, username, isInitiator) {
     if (this.peers.has(userId)) return;
-    console.log('[voice] Connecting to', userId,
-      isInitiator ? '(initiator)' : '(answerer)');
 
-    // Pre-populate speakers map with username
+    console.log('[voice] Connect to', userId,
+      isInitiator ? '(init)' : '(answer)');
+
+    // Pre-populate speaker entry with username
     if (!this.speakers.has(userId)) {
       this.speakers.set(userId, {
         username,
+        audioEl:  null,
         analyser: null,
+        audioCtx: null,
         muted:    false,
         deafened: false
       });
+    } else {
+      // Update username in case it was missing
+      const spk = this.speakers.get(userId);
+      spk.username = username;
     }
 
     const pc = this._createPC(userId);
@@ -161,15 +196,17 @@ class VoiceManager {
     }
   }
 
+  // ── Handle incoming signal ────────────────────────────
   async handleSignal(fromId, fromUser, signal) {
-    // Ensure peer connection exists
     if (!this.peers.has(fromId)) {
-      console.log('[voice] Creating PC for',
-        fromId, '(signal arrived first)');
+      console.log('[voice] Signal from new peer',
+        fromId);
       if (!this.speakers.has(fromId)) {
         this.speakers.set(fromId, {
           username: fromUser,
+          audioEl:  null,
           analyser: null,
+          audioCtx: null,
           muted:    false,
           deafened: false
         });
@@ -205,52 +242,66 @@ class VoiceManager {
     }
   }
 
+  // ── Disconnect a peer ─────────────────────────────────
   disconnectPeer(userId) {
     const pc = this.peers.get(userId);
     if (pc) {
       pc.close();
       this.peers.delete(userId);
     }
+
     const spk = this.speakers.get(userId);
-    if (spk?.audioEl) {
-      spk.audioEl.srcObject = null;
-      this._audioEls.delete(spk.audioEl);
+    if (spk) {
+      // Stop audio playback
+      if (spk.audioEl) {
+        spk.audioEl.srcObject = null;
+        spk.audioEl.pause();
+        this._audioEls.delete(spk.audioEl);
+      }
+      // Close VU AudioContext
+      if (spk.audioCtx &&
+          spk.audioCtx.state !== 'closed') {
+        spk.audioCtx.close();
+      }
+      this.speakers.delete(userId);
     }
-    this.speakers.delete(userId);
   }
 
+  // ── Leave call ────────────────────────────────────────
   leave() {
     clearInterval(this.vuInterval);
     this.vuInterval = null;
 
-    this.peers.forEach((pc, uid) => {
-      pc.close();
-    });
+    // Close all peer connections
+    this.peers.forEach(pc => pc.close());
     this.peers.clear();
 
-    this._audioEls.forEach(a => {
-      a.srcObject = null;
+    // Stop all audio elements and close AudioContexts
+    this.speakers.forEach((spk) => {
+      if (spk.audioEl) {
+        spk.audioEl.srcObject = null;
+        spk.audioEl.pause();
+      }
+      if (spk.audioCtx &&
+          spk.audioCtx.state !== 'closed')
+        spk.audioCtx.close();
     });
-    this._audioEls.clear();
     this.speakers.clear();
+    this._audioEls.clear();
 
+    // Stop local mic
     if (this.stream)
       this.stream.getTracks()
         .forEach(t => t.stop());
 
-    if (this.audioCtx &&
-        this.audioCtx.state !== 'closed')
-      this.audioCtx.close();
-
     this.stream     = null;
-    this.audioCtx   = null;
-    this.analyser   = null;
     this.vchatId    = null;
     this.myUserId   = null;
     this.muted      = false;
     this.deafened   = false;
   }
 
+  // ── Mute / deafen ─────────────────────────────────────
   setMuted(muted) {
     this.muted = muted;
     if (this.stream)
@@ -266,23 +317,33 @@ class VoiceManager {
     if (spk) spk.deafened = deafened;
 
     // Mute/unmute all remote audio elements
-    this._audioEls.forEach(a => {
-      a.muted = deafened;
+    // This is the clean way — no AudioContext
+    // routing to undo
+    this._audioEls.forEach(audio => {
+      audio.muted = deafened;
     });
   }
 
-  updatePeerState(userId, username,
-                   muted, deafened) {
+  // ── Remote peer state update ──────────────────────────
+  updatePeerState(userId, username, muted, deafened) {
     const existing = this.speakers.get(userId);
     this.speakers.set(userId, {
-      ...(existing ?? { username, analyser: null }),
-      muted,
-      deafened
+      ...(existing ?? {
+        username,
+        audioEl:  null,
+        analyser: null,
+        audioCtx: null
+      }),
+      username,
+      muted:    !!muted,
+      deafened: !!deafened
     });
   }
 
+  // ── VU meter polling ──────────────────────────────────
   _pollVU() {
     if (!this.onVU) return;
+
     const arr = [];
     this.speakers.forEach((spk, uid) => {
       let amp = 0;
@@ -304,11 +365,12 @@ class VoiceManager {
         deafened: !!spk.deafened
       });
     });
+
     this.onVU(arr);
   }
 
   isActive() { return this.vchatId !== null; }
 }
 
-window.SC      = window.SC || {};
+window.SC       = window.SC || {};
 window.SC.voice = new VoiceManager();
